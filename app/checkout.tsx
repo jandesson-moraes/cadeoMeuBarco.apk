@@ -1,0 +1,1544 @@
+import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as Clipboard from "expo-clipboard";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  where,
+} from "firebase/firestore";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  AppState, // 🟢 Proteção contra fechamento
+  Image,
+  Keyboard,
+  Modal,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import Animated, {
+  FadeInDown,
+  FadeInUp,
+  Layout,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { auth, db } from "../services/firebase";
+import {
+  calcularPreviaTaxaNoApp,
+  deveExibirBotaoComprar,
+  localizarBarcoDaGrade,
+  obterConfiguracaoVendasBarco,
+  obterIdBarcoDaGrade,
+} from "../services/vendasPassagens";
+
+interface Passageiro {
+  id: number;
+  nome: string;
+  documento: string;
+  nacionalidade: string;
+  nascimento: string;
+}
+
+export default function CheckoutPassagem() {
+  const insets = useSafeAreaInsets();
+  const router = useRouter();
+  const params = useLocalSearchParams();
+
+  // 🟢 IDENTIDADE DO USUÁRIO (Corrigido)
+  const user = auth.currentUser;
+
+  // 🟢 REFERÊNCIA PARA O MONITOR (Gestão de RAM)
+  const unsubPagamento = useRef<(() => void) | null>(null);
+  const appAtivoRef = useRef(true);
+  const mountedRef = useRef(true);
+  const chaveIdempotenciaRef = useRef(
+    `checkout_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`,
+  );
+
+  // 🛡️ VALIDAÇÃO MATEMÁTICA DE CPF (Algoritmo Oficial)
+  const validarCPF = (cpf: string) => {
+    cpf = cpf.replace(/[^\d]+/g, "");
+    if (cpf.length !== 11 || !!cpf.match(/(\d)\1{10}/)) return false;
+
+    let soma = 0;
+    let resto;
+
+    for (let i = 1; i <= 9; i++)
+      soma += parseInt(cpf.substring(i - 1, i)) * (11 - i);
+
+    resto = (soma * 10) % 11;
+    if (resto === 10 || resto === 11) resto = 0;
+    if (resto !== parseInt(cpf.substring(9, 10))) return false;
+
+    soma = 0;
+    for (let i = 1; i <= 10; i++)
+      soma += parseInt(cpf.substring(i - 1, i)) * (12 - i);
+
+    resto = (soma * 10) % 11;
+    if (resto === 10 || resto === 11) resto = 0;
+    if (resto !== parseInt(cpf.substring(10, 11))) return false;
+
+    return true;
+  };
+
+  const formatarCPF = (v: string) => {
+    v = v.replace(/\D/g, "");
+    if (v.length > 11) v = v.substring(0, 11);
+    return v
+      .replace(/(\d{3})(\d)/, "$1.$2")
+      .replace(/(\d{3})(\d)/, "$1.$2")
+      .replace(/(\d{3})(\d{1,2})$/, "$1-$2");
+  };
+
+  const formatarDataInput = (v: string) => {
+    v = v.replace(/\D/g, "");
+    if (v.length > 8) v = v.substring(0, 8);
+    return v.replace(/(\d{2})(\d)/, "$1/$2").replace(/(\d{2})(\d)/, "$1/$2");
+  };
+
+  const limparCPF = (cpf: string) => {
+    return String(cpf || "").replace(/\D/g, "");
+  };
+
+
+  const montarDataHoraViagem = (dataIso: string, horario: string) => {
+    if (!dataIso || !dataIso.includes("-")) return null;
+
+    const [ano, mes, dia] = dataIso.split("-").map((item) => Number(item));
+    const horarioLimpo = String(horario || "").match(/(\d{1,2}):(\d{2})/);
+    const hora = horarioLimpo ? Number(horarioLimpo[1]) : 23;
+    const minuto = horarioLimpo ? Number(horarioLimpo[2]) : 59;
+
+    const data = new Date(ano, mes - 1, dia, hora, minuto, 0, 0);
+
+    if (Number.isNaN(data.getTime())) return null;
+
+    return data;
+  };
+
+  const viagemJaEncerrada = () => {
+    const dataHora = montarDataHoraViagem(dataViagemParam, horarioEmbarque);
+
+    if (!dataHora) return false;
+
+    return dataHora.getTime() < Date.now();
+  };
+
+  const getCheckoutStorageKey = () => {
+    return `@cmb_checkout_pix_${user?.uid || "anonimo"}_${String(idViagemParam || idDaViagem || "sem_viagem")}_${dataViagemParam || "sem_data"}`;
+  };
+
+  const idDaViagem = params.viagemId || params.gradeId;
+  const origemDesejada = String(params.origemDesejada || "");
+  const destinoDesejado = String(params.destinoDesejado || "");
+  const dataViagemParam = String(params.dataViagem || "");
+  const idViagemParam = String(params.idViagem || "");
+  const horarioVindoDaBusca = String(params.horarioSaida || "");
+  const barcoIdParam = String(params.barcoId || "");
+
+  const [carregando, setCarregando] = useState(false);
+  const [loadingViagem, setLoadingViagem] = useState(true);
+  const [verificando, setVerificando] = useState(false);
+  const [dadosPix, setDadosPix] = useState<any>(null);
+  const [viagemData, setViagemData] = useState<any>(null);
+  const [barcoData, setBarcoData] = useState<any>(null);
+  const [barcoIdResolvido, setBarcoIdResolvido] = useState("");
+  const [resumoOficial, setResumoOficial] = useState<any>(null);
+  const [diaSemanaNome, setDiaSemanaNome] = useState("");
+  const [precosReais, setPrecosReais] = useState({
+    rede: 0,
+    poltrona: 0,
+    suite: 0,
+  });
+  const [tipoAcomodacao, setTipoAcomodacao] = useState<
+    "rede" | "poltrona" | "suite"
+  >("rede");
+  const [incluiRefeicao, setIncluiRefeicao] = useState(false);
+  const [taxaRefeicao, setTaxaRefeicao] = useState(0);
+  const [horarioEmbarque, setHorarioEmbarque] = useState(
+    horarioVindoDaBusca || "---",
+  );
+
+  const [perfilComprador, setPerfilComprador] = useState<any>(null);
+  const [carregandoPerfilComprador, setCarregandoPerfilComprador] =
+    useState(true);
+
+  const [passageiros, setPassageiros] = useState<Passageiro[]>([
+    {
+      id: Date.now(),
+      nome: "",
+      documento: "",
+      nacionalidade: "Brasileira",
+      nascimento: "",
+    },
+  ]);
+  const [modalAviso, setModalAviso] = useState({
+    visivel: false,
+    titulo: "",
+    mensagem: "",
+    icone: "alert-circle" as any,
+    cor: "#facc15",
+  });
+  const [foiCopiado, setFoiCopiado] = useState(false);
+
+  const exibirAviso = (
+    titulo: string,
+    mensagem: string,
+    tipo: "erro" | "aviso" = "aviso",
+  ) => {
+    setModalAviso({
+      visivel: true,
+      titulo,
+      mensagem,
+      icone: tipo === "erro" ? "close-circle" : "alert-circle",
+      cor: tipo === "erro" ? "#ef4444" : "#facc15",
+    });
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    return () => {
+      mountedRef.current = false;
+      if (unsubPagamento.current) {
+        unsubPagamento.current();
+        unsubPagamento.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    async function restaurarPixPendente() {
+      try {
+        const salvo = await AsyncStorage.getItem(getCheckoutStorageKey());
+
+        if (!salvo || !mountedRef.current) return;
+
+        const pix = JSON.parse(salvo);
+
+        if (pix?.id_transacao) {
+          setDadosPix(pix);
+          setResumoOficial(pix.financeiro || null);
+        }
+      } catch (error) {
+        console.log("Erro ao restaurar Pix pendente:", error);
+      }
+    }
+
+    restaurarPixPendente();
+  }, [user?.uid, idViagemParam, idDaViagem, dataViagemParam]);
+
+  useEffect(() => {
+    async function carregarPerfilComprador() {
+      try {
+        if (!user?.uid) {
+          setPerfilComprador(null);
+          return;
+        }
+
+        const perfilRef = doc(db, "usuarios", user.uid);
+        const perfilSnap = await getDoc(perfilRef);
+
+        if (perfilSnap.exists()) {
+          setPerfilComprador(perfilSnap.data());
+        } else {
+          setPerfilComprador(null);
+        }
+      } catch (error) {
+        console.log("Erro ao carregar perfil do comprador:", error);
+        setPerfilComprador(null);
+      } finally {
+        setCarregandoPerfilComprador(false);
+      }
+    }
+
+    carregarPerfilComprador();
+  }, [user?.uid]);
+
+  useEffect(() => {
+    async function carregarDados() {
+      if (!idDaViagem) return;
+
+      try {
+        setLoadingViagem(true);
+
+        const snap = await getDoc(
+          doc(db, "grades_viagens", String(idDaViagem)),
+        );
+
+        if (!snap.exists()) {
+          setViagemData(null);
+          setBarcoData(null);
+          setBarcoIdResolvido("");
+          return;
+        }
+
+        const dados = {
+          id: snap.id,
+          ...snap.data(),
+        } as any;
+
+        setViagemData(dados);
+
+        if (!horarioEmbarque || horarioEmbarque === "---") {
+          setHorarioEmbarque(
+            dados.horarioSaida ||
+              dados.horario_saida_origem ||
+              "Confirme no porto",
+          );
+        }
+
+        const itinerario = Array.isArray(dados.itinerario)
+          ? dados.itinerario
+          : Array.isArray(dados.escalas)
+            ? dados.escalas
+            : [];
+
+        const normalizar = (texto: string) =>
+          String(texto || "")
+            .trim()
+            .toLowerCase()
+            .split(" - ")[0];
+
+        const destinoAlvo = normalizar(destinoDesejado);
+        const parada = itinerario.find(
+          (item: any) =>
+            normalizar(item?.porto || item?.cidade) === destinoAlvo,
+        );
+
+        if (parada) {
+          setPrecosReais({
+            rede: Number(
+              parada.preco_da_origem ??
+                parada.precoRede ??
+                parada.preco_rede ??
+                parada.preco ??
+                0,
+            ),
+            poltrona: Number(
+              parada.preco_poltrona ??
+                parada.precoPoltrona ??
+                0,
+            ),
+            suite: Number(
+              parada.preco_suite ??
+                parada.precoSuite ??
+                0,
+            ),
+          });
+          setTaxaRefeicao(
+            Number(
+              parada.preco_refeicao ??
+                parada.precoRefeicao ??
+                0,
+            ),
+          );
+        }
+
+        let barcoEncontrado: any = null;
+        const candidatoId =
+          barcoIdParam || obterIdBarcoDaGrade(dados);
+
+        if (candidatoId) {
+          const barcoSnap = await getDoc(
+            doc(db, "embarcacoes", candidatoId),
+          );
+
+          if (barcoSnap.exists()) {
+            barcoEncontrado = {
+              id: barcoSnap.id,
+              ...barcoSnap.data(),
+            };
+          }
+        }
+
+        if (!barcoEncontrado) {
+          const barcosSnap = await getDocs(
+            collection(db, "embarcacoes"),
+          );
+          const lista = barcosSnap.docs.map((documento) => ({
+            id: documento.id,
+            ...documento.data(),
+          }));
+
+          barcoEncontrado = localizarBarcoDaGrade(
+            dados,
+            lista,
+          );
+        }
+
+        setBarcoData(barcoEncontrado);
+        setBarcoIdResolvido(barcoEncontrado?.id || "");
+      } catch (error) {
+        console.log("Erro ao carregar checkout:", error);
+        setViagemData(null);
+        setBarcoData(null);
+        setBarcoIdResolvido("");
+      } finally {
+        setLoadingViagem(false);
+      }
+    }
+
+    carregarDados();
+  }, [
+    idDaViagem,
+    destinoDesejado,
+    barcoIdParam,
+    horarioEmbarque,
+  ]);
+
+  useEffect(() => {
+    if (dataViagemParam && dataViagemParam.includes("-")) {
+      const [ano, mes, dia] = dataViagemParam.split("-");
+      const dataReal = new Date(Number(ano), Number(mes) - 1, Number(dia));
+      const nome = dataReal.toLocaleDateString("pt-BR", { weekday: "long" });
+      setDiaSemanaNome(nome.charAt(0).toUpperCase() + nome.slice(1));
+    }
+  }, [dataViagemParam]);
+
+  // 📡 MONITOR DE PAGAMENTO COM GESTÃO DE MEMÓRIA
+  const iniciarMonitoramento = (idTransacao: string) => {
+    const transacao = String(idTransacao || "").trim();
+
+    if (!transacao || !mountedRef.current) return;
+
+    try {
+      if (unsubPagamento.current) {
+        unsubPagamento.current();
+        unsubPagamento.current = null;
+      }
+
+      const q = query(
+        collection(db, "passagens"),
+        where("pagamentoId", "==", transacao),
+      );
+
+      unsubPagamento.current = onSnapshot(
+        q,
+        (snap) => {
+          if (!mountedRef.current) return;
+
+          const aprovado =
+            !snap.empty &&
+            snap.docs.every((d) => {
+              const status = String(d.data().status || "")
+                .toUpperCase()
+                .trim();
+
+              return (
+                status === "APROVADO" ||
+                status === "PAGO" ||
+                status === "CONCLUIDO"
+              );
+            });
+
+          if (!aprovado) return;
+
+          if (unsubPagamento.current) {
+            unsubPagamento.current();
+            unsubPagamento.current = null;
+          }
+
+          AsyncStorage.removeItem(getCheckoutStorageKey()).catch(() => {});
+
+          router.replace({
+            pathname: "/bilhete",
+            params: { pagamentoId: transacao },
+          });
+        },
+        (error) => {
+          console.log("Erro no monitoramento do pagamento:", error);
+        },
+      );
+    } catch (error) {
+      console.log("Falha ao iniciar monitoramento:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (dadosPix?.id_transacao) iniciarMonitoramento(dadosPix.id_transacao);
+
+    return () => {
+      if (unsubPagamento.current) {
+        unsubPagamento.current();
+        unsubPagamento.current = null;
+      }
+    };
+  }, [dadosPix?.id_transacao]);
+
+  useEffect(() => {
+    async function salvarPixPendente() {
+      try {
+        if (dadosPix?.id_transacao) {
+          await AsyncStorage.setItem(
+            getCheckoutStorageKey(),
+            JSON.stringify(dadosPix),
+          );
+        }
+      } catch (error) {
+        console.log("Erro ao salvar Pix pendente:", error);
+      }
+    }
+
+    salvarPixPendente();
+  }, [
+    dadosPix?.id_transacao,
+    user?.uid,
+    idViagemParam,
+    idDaViagem,
+    dataViagemParam,
+  ]);
+
+  // 🟢 GESTÃO DE ESTADO DO APP (Evita fechar no banco)
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState) => {
+      appAtivoRef.current = nextState === "active";
+
+      if (nextState === "active" && dadosPix?.id_transacao) {
+        setTimeout(() => {
+          if (mountedRef.current) {
+            iniciarMonitoramento(dadosPix.id_transacao);
+          }
+        }, 800);
+      }
+
+      if (nextState === "background" || nextState === "inactive") {
+        if (unsubPagamento.current) {
+          unsubPagamento.current();
+          unsubPagamento.current = null;
+        }
+      }
+    });
+
+    return () => sub.remove();
+  }, [dadosPix?.id_transacao]);
+
+  const compradorCidadeResidencia = String(
+    perfilComprador?.cidadeResidencia || "",
+  ).trim();
+  const compradorEstadoResidencia = String(
+    perfilComprador?.estadoResidencia || "",
+  ).trim();
+  const compradorEstadoResidenciaNome = String(
+    perfilComprador?.estadoResidenciaNome || "",
+  ).trim();
+  const compradorCidadeResidenciaCompleta = String(
+    perfilComprador?.cidadeResidenciaCompleta ||
+      (compradorCidadeResidencia && compradorEstadoResidencia
+        ? `${compradorCidadeResidencia} - ${compradorEstadoResidencia}`
+        : ""),
+  ).trim();
+  const compradorCidadeResidenciaCodigoIbge = String(
+    perfilComprador?.cidadeResidenciaCodigoIbge || "",
+  ).trim();
+  const perfilComCidadeCompleta =
+    !!compradorCidadeResidencia && !!compradorEstadoResidencia;
+
+  const configuracaoVendas = useMemo(
+    () => obterConfiguracaoVendasBarco(barcoData),
+    [barcoData],
+  );
+
+  const vendasLiberadas = useMemo(
+    () => deveExibirBotaoComprar(barcoData),
+    [barcoData],
+  );
+
+  const previaFinanceira = useMemo(
+    () =>
+      calcularPreviaTaxaNoApp({
+        regra: configuracaoVendas.regraTaxa,
+        quantidade: passageiros.length,
+        valorUnitario: precosReais[tipoAcomodacao],
+        adicionais: incluiRefeicao
+          ? taxaRefeicao * passageiros.length
+          : 0,
+      }),
+    [
+      configuracaoVendas.regraTaxa,
+      passageiros.length,
+      precosReais,
+      tipoAcomodacao,
+      incluiRefeicao,
+      taxaRefeicao,
+    ],
+  );
+
+  const totalGeral = Number(
+    resumoOficial?.totalPagoPassageiro ??
+      previaFinanceira.totalPassageiro,
+  );
+
+  const vendaForaDoPrazo = () => {
+    const dataHora = montarDataHoraViagem(
+      dataViagemParam,
+      horarioEmbarque,
+    );
+
+    if (!dataHora) return false;
+
+    const limiteHoras = Math.max(
+      0,
+      Number(configuracaoVendas.limiteHorasAntesSaida || 0),
+    );
+    const limiteMs = limiteHoras * 60 * 60 * 1000;
+
+    return Date.now() >= dataHora.getTime() - limiteMs;
+  };
+
+  const removerPassageiro = (id: number) => {
+    if (passageiros.length > 1) {
+      setPassageiros(passageiros.filter((p) => p.id !== id));
+    } else {
+      exibirAviso("Ação Bloqueada", "É necessário ao menos 1 passageiro.");
+    }
+  };
+
+  const verificarManual = async () => {
+    if (!dadosPix?.id_transacao) return;
+    setVerificando(true);
+    try {
+      const q = query(
+        collection(db, "passagens"),
+        where("pagamentoId", "==", String(dadosPix.id_transacao)),
+      );
+      const snap = await getDocs(q);
+      if (
+        !snap.empty &&
+        snap.docs.every((d) => {
+          const status = String(d.data().status || "")
+            .toUpperCase()
+            .trim();
+          return (
+            status === "APROVADO" || status === "PAGO" || status === "CONCLUIDO"
+          );
+        })
+      ) {
+        router.replace({
+          pathname: "/bilhete",
+          params: { pagamentoId: String(dadosPix.id_transacao) },
+        });
+      } else {
+        exibirAviso("Aguardando", "Pagamento não confirmado ainda.");
+      }
+    } catch (e) {
+      console.log(e);
+    } finally {
+      setVerificando(false);
+    }
+  };
+
+  const handleGerarPix = async () => {
+    Keyboard.dismiss();
+
+    if (!perfilComCidadeCompleta) {
+      exibirAviso(
+        "Complete seu perfil",
+        "Informe sua cidade e estado em Meus Dados antes de comprar a passagem.",
+        "aviso",
+      );
+      return;
+    }
+
+    if (!user?.uid) {
+      exibirAviso(
+        "Login necessário",
+        "Entre novamente na sua conta antes de concluir a compra.",
+        "aviso",
+      );
+      return;
+    }
+
+    if (!idDaViagem || !viagemData) {
+      exibirAviso(
+        "Viagem indisponível",
+        "Não foi possível carregar os dados da viagem. Volte e selecione a viagem novamente.",
+        "erro",
+      );
+      return;
+    }
+
+    if (!barcoData || !barcoIdResolvido) {
+      exibirAviso(
+        "Embarcação não vinculada",
+        "Não foi possível identificar a embarcação desta viagem.",
+        "erro",
+      );
+      return;
+    }
+
+    if (!vendasLiberadas) {
+      exibirAviso(
+        "Venda indisponível",
+        "Esta embarcação não está com a venda de passagens habilitada.",
+        "aviso",
+      );
+      return;
+    }
+
+    if (viagemJaEncerrada()) {
+      exibirAviso(
+        "Viagem encerrada",
+        "Essa viagem já passou do horário de saída. Escolha uma próxima saída disponível.",
+        "aviso",
+      );
+      return;
+    }
+
+    if (vendaForaDoPrazo()) {
+      exibirAviso(
+        "Vendas encerradas",
+        `As vendas desta embarcação encerram ${configuracaoVendas.limiteHorasAntesSaida} hora(s) antes da saída.`,
+        "aviso",
+      );
+      return;
+    }
+
+    if (!Number.isFinite(totalGeral) || totalGeral <= 0) {
+      exibirAviso(
+        "Valor inválido",
+        "Não foi possível calcular o valor da passagem. Volte e selecione origem, destino e acomodação novamente.",
+        "erro",
+      );
+      return;
+    }
+
+    for (let i = 0; i < passageiros.length; i++) {
+      const passageiro = passageiros[i];
+      const referencia =
+        passageiros.length > 1
+          ? ` do Passageiro ${i + 1}`
+          : "";
+
+      if (
+        !passageiro.nome.trim() ||
+        passageiro.nome.trim().split(/\s+/).length < 2
+      ) {
+        exibirAviso(
+          "Nome incompleto",
+          `Digite o nome completo${referencia}.`,
+        );
+        return;
+      }
+
+      if (!passageiro.nacionalidade.trim()) {
+        exibirAviso(
+          "Nacionalidade",
+          `Informe a nacionalidade${referencia}.`,
+        );
+        return;
+      }
+
+      if (!validarCPF(passageiro.documento)) {
+        exibirAviso(
+          "CPF inválido",
+          `O CPF informado${referencia} não é válido.`,
+        );
+        return;
+      }
+
+      if (passageiro.nascimento.length < 10) {
+        exibirAviso(
+          "Data de nascimento",
+          `Informe a data completa${referencia} (DD/MM/AAAA).`,
+        );
+        return;
+      }
+    }
+
+    setCarregando(true);
+
+    try {
+      const token = await user.getIdToken(true);
+      const resposta = await fetch(
+        "https://us-central1-sistema-navegacao.cloudfunctions.net/gerarPixSeguro",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            gradeId: String(idDaViagem),
+            idViagem:
+              idViagemParam ||
+              `${String(idDaViagem)}_${dataViagemParam}`,
+            barcoId: barcoIdResolvido,
+            origem: origemDesejada,
+            destino: destinoDesejado,
+            tipoVaga: tipoAcomodacao,
+            refeicao: incluiRefeicao,
+            dataViagem: dataViagemParam,
+            horarioSaida: horarioEmbarque,
+            chaveIdempotencia:
+              chaveIdempotenciaRef.current,
+            email: user.email || "",
+            compradorCidadeResidencia,
+            compradorEstadoResidencia,
+            compradorEstadoResidenciaNome,
+            compradorCidadeResidenciaCompleta,
+            compradorCidadeResidenciaCodigoIbge,
+            compradorCidadeResidenciaFonte:
+              perfilComprador?.cidadeResidenciaFonte ||
+              "ibge",
+            passageiros: passageiros.map((passageiro) => ({
+              nome: passageiro.nome.trim(),
+              documento: limparCPF(
+                passageiro.documento,
+              ),
+              nacionalidade:
+                passageiro.nacionalidade.trim(),
+              nascimento: passageiro.nascimento,
+            })),
+          }),
+        },
+      );
+
+      const dados = await resposta.json();
+
+      if (!resposta.ok) {
+        throw new Error(
+          dados?.erro ||
+            `Servidor respondeu ${resposta.status}.`,
+        );
+      }
+
+      if (
+        !dados?.id_transacao ||
+        !dados?.qr_code_copia_cola
+      ) {
+        throw new Error(
+          "A resposta do Pix veio incompleta.",
+        );
+      }
+
+      setResumoOficial(dados.financeiro || null);
+      setDadosPix(dados);
+
+      await AsyncStorage.setItem(
+        getCheckoutStorageKey(),
+        JSON.stringify(dados),
+      );
+
+      iniciarMonitoramento(
+        String(dados.id_transacao),
+      );
+    } catch (error: any) {
+      console.log("Erro ao gerar Pix seguro:", error);
+      exibirAviso(
+        "Não foi possível gerar o Pix",
+        error?.message ||
+          "Tente novamente em alguns instantes.",
+        "erro",
+      );
+    } finally {
+      setCarregando(false);
+    }
+  };
+
+  if (loadingViagem)
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#38bdf8" />
+      </View>
+    );
+
+  if (!barcoData || !barcoIdResolvido || !vendasLiberadas) {
+    return (
+      <View style={[styles.center, { paddingHorizontal: 28 }]}>
+        <Ionicons
+          name="ticket-outline"
+          size={58}
+          color="#64748b"
+        />
+        <Text style={styles.indisponivelTitulo}>
+          Venda indisponível
+        </Text>
+        <Text style={styles.indisponivelTexto}>
+          Esta embarcação não está habilitada para vender
+          passagens pelo aplicativo.
+        </Text>
+        <TouchableOpacity
+          style={styles.btnVoltar}
+          onPress={() => router.back()}
+        >
+          <Text style={styles.btnVoltarTexto}>
+            VOLTAR ÀS VIAGENS
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top + 10 }]}>
+      <Modal visible={modalAviso.visivel} transparent animationType="fade">
+        <View style={styles.overlay}>
+          <View style={styles.modalFeedback}>
+            <Ionicons
+              name={modalAviso.icone}
+              size={50}
+              color={modalAviso.cor}
+            />
+            <Text style={styles.modalTitle}>{modalAviso.titulo}</Text>
+            <Text style={styles.modalSub}>{modalAviso.mensagem}</Text>
+            <TouchableOpacity
+              style={styles.btnModalClose}
+              onPress={() => setModalAviso({ ...modalAviso, visivel: false })}
+            >
+              <Text style={styles.btnModalCloseText}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <ScrollView
+        contentContainerStyle={{ paddingBottom: 100 }}
+        showsVerticalScrollIndicator={false}
+      >
+        <Animated.View entering={FadeInDown} style={styles.cardInfo}>
+          <Text style={styles.barcoTitle}>
+            🛳️ {barcoData?.nome || viagemData?.nome_barco || "Embarcação"}
+          </Text>
+          <Text style={styles.rotaText}>
+            {origemDesejada} ➔ {destinoDesejado}
+          </Text>
+          <View style={styles.divider} />
+          <Text style={styles.subText}>
+            {diaSemanaNome}, {dataViagemParam.split("-").reverse().join("/")} às{" "}
+            {horarioEmbarque}
+          </Text>
+        </Animated.View>
+
+        {dadosPix ? (
+          <Animated.View entering={FadeInUp} style={styles.cardPix}>
+            <Ionicons name="qr-code" size={50} color="#10b981" />
+            <Text style={styles.pixTitle}>PIX GERADO</Text>
+            <Text style={styles.pixValor}>
+              R$ {Number(
+                dadosPix?.financeiro?.totalPagoPassageiro ||
+                  totalGeral,
+              ).toFixed(2)}
+            </Text>
+            {dadosPix.qr_code_base64 && (
+              <Image
+                source={{
+                  uri: `data:image/png;base64,${dadosPix.qr_code_base64}`,
+                }}
+                style={styles.qrCode}
+              />
+            )}
+            <TouchableOpacity
+              style={[
+                styles.btnCopy,
+                foiCopiado && { backgroundColor: "#10b981" },
+              ]}
+              onPress={() => {
+                if (!dadosPix?.qr_code_copia_cola) {
+                  exibirAviso(
+                    "Pix indisponível",
+                    "O código Pix ainda não foi carregado.",
+                    "aviso",
+                  );
+                  return;
+                }
+
+                Clipboard.setStringAsync(dadosPix.qr_code_copia_cola);
+                setFoiCopiado(true);
+                setTimeout(() => {
+                  if (mountedRef.current) setFoiCopiado(false);
+                }, 3000);
+              }}
+            >
+              <Ionicons
+                name={foiCopiado ? "checkmark-circle" : "copy-outline"}
+                size={20}
+                color={foiCopiado ? "#fff" : "#0f172a"}
+                style={{ marginRight: 8 }}
+              />
+              <Text
+                style={[styles.btnCopyText, foiCopiado && { color: "#fff" }]}
+              >
+                {foiCopiado ? "CÓDIGO COPIADO!" : "COPIAR CÓDIGO PIX"}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.btnVerificar}
+              onPress={verificarManual}
+              disabled={verificando}
+            >
+              {verificando ? (
+                <ActivityIndicator color="#38bdf8" />
+              ) : (
+                <Text style={styles.btnVerificarText}>
+                  JÁ PAGUEI, VERIFICAR STATUS
+                </Text>
+              )}
+            </TouchableOpacity>
+          </Animated.View>
+        ) : (
+          <>
+            <Text style={styles.sectionTitle}>1. Tipo de Acomodação</Text>
+            <View style={styles.rowOptions}>
+              {["rede", "poltrona", "suite"].map((tipo) => (
+                <TouchableOpacity
+                  key={tipo}
+                  style={[
+                    styles.optionBtn,
+                    tipoAcomodacao === tipo && styles.optionBtnActive,
+                  ]}
+                  onPress={() => setTipoAcomodacao(tipo as any)}
+                >
+                  <Text
+                    style={[
+                      styles.optionLabel,
+                      tipoAcomodacao === tipo && { color: "#38bdf8" },
+                    ]}
+                  >
+                    {tipo.toUpperCase()}
+                  </Text>
+                  <Text style={styles.optionPrice}>
+                    R${" "}
+                    {precosReais[tipo as keyof typeof precosReais].toFixed(2)}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <Text style={styles.sectionTitle}>2. Incluir Refeição?</Text>
+            <View style={styles.rowOptions}>
+              <TouchableOpacity
+                style={[
+                  styles.optionBtn,
+                  !incluiRefeicao && styles.optionBtnActive,
+                ]}
+                onPress={() => setIncluiRefeicao(false)}
+              >
+                <Text style={styles.optionPrice}>Não</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.optionBtn,
+                  incluiRefeicao && styles.optionBtnActive,
+                ]}
+                onPress={() => setIncluiRefeicao(true)}
+              >
+                <Text style={styles.optionPrice}>
+                  Sim (+ R$ {taxaRefeicao.toFixed(2)})
+                </Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.sectionTitle}>3. Dados dos Passageiros</Text>
+
+            <View style={styles.avisoPrivacidade}>
+              <Ionicons
+                name="shield-checkmark-outline"
+                size={19}
+                color="#38bdf8"
+              />
+              <Text style={styles.avisoPrivacidadeTexto}>
+                CPF e nascimento são usados nesta compra para validação. No
+                registro da passagem, o CPF fica mascarado e a data de
+                nascimento completa não é salva pelo app.
+              </Text>
+            </View>
+
+            <View
+              style={[
+                styles.perfilCidadeBox,
+                !perfilComCidadeCompleta && styles.perfilCidadeBoxAlerta,
+              ]}
+            >
+              <Ionicons
+                name={perfilComCidadeCompleta ? "location" : "warning-outline"}
+                size={19}
+                color={perfilComCidadeCompleta ? "#10b981" : "#fbbf24"}
+              />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.perfilCidadeTitulo}>
+                  {perfilComCidadeCompleta
+                    ? "Cidade do comprador"
+                    : "Complete seu perfil"}
+                </Text>
+                <Text style={styles.perfilCidadeTexto}>
+                  {carregandoPerfilComprador
+                    ? "Carregando cidade do comprador..."
+                    : perfilComCidadeCompleta
+                      ? compradorCidadeResidenciaCompleta
+                      : "Informe sua cidade e estado em Meus Dados para continuar a compra."}
+                </Text>
+              </View>
+              {!perfilComCidadeCompleta && !carregandoPerfilComprador && (
+                <TouchableOpacity
+                  style={styles.btnCompletarPerfil}
+                  onPress={() => router.push("/dados-passageiro" as any)}
+                >
+                  <Text style={styles.btnCompletarPerfilTexto}>ABRIR</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {passageiros.map((p, index) => (
+              <Animated.View
+                key={p.id}
+                layout={Layout.springify()}
+                entering={FadeInDown.delay(index * 100)}
+                style={styles.cardPassageiro}
+              >
+                <View style={styles.headerPass}>
+                  <Text style={styles.passNum}>Passageiro {index + 1}</Text>
+                  {passageiros.length > 1 && (
+                    <TouchableOpacity onPress={() => removerPassageiro(p.id)}>
+                      <Ionicons name="close-circle" size={26} color="#ef4444" />
+                    </TouchableOpacity>
+                  )}
+                </View>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Nome Completo"
+                  value={p.nome}
+                  onChangeText={(v) => {
+                    const n = [...passageiros];
+                    n[index].nome = v;
+                    setPassageiros(n);
+                  }}
+                  placeholderTextColor="#64748b"
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Nacionalidade"
+                  value={p.nacionalidade}
+                  onChangeText={(v) => {
+                    const n = [...passageiros];
+                    n[index].nacionalidade = v;
+                    setPassageiros(n);
+                  }}
+                  placeholderTextColor="#64748b"
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="CPF"
+                  keyboardType="numeric"
+                  value={p.documento}
+                  onChangeText={(v) => {
+                    const n = [...passageiros];
+                    n[index].documento = formatarCPF(v);
+                    setPassageiros(n);
+                  }}
+                  placeholderTextColor="#64748b"
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Nascimento (DD/MM/AAAA)"
+                  keyboardType="numeric"
+                  value={p.nascimento}
+                  onChangeText={(v) => {
+                    const formatada = formatarDataInput(v);
+                    const n = [...passageiros];
+                    n[index].nascimento = formatada;
+                    setPassageiros(n);
+                    if (formatada.length === 10) Keyboard.dismiss();
+                  }}
+                  placeholderTextColor="#64748b"
+                />
+              </Animated.View>
+            ))}
+            <TouchableOpacity
+              style={styles.btnAdd}
+              onPress={() =>
+                setPassageiros([
+                  ...passageiros,
+                  {
+                    id: Date.now(),
+                    nome: "",
+                    documento: "",
+                    nacionalidade: "Brasileira",
+                    nascimento: "",
+                  },
+                ])
+              }
+            >
+              <Ionicons name="person-add" size={18} color="#38bdf8" />
+              <Text style={styles.btnAddText}>ADICIONAR OUTRO PASSAGEIRO</Text>
+            </TouchableOpacity>
+            <View style={styles.cardTotal}>
+              <View style={styles.linhaResumo}>
+                <Text style={styles.resumoLabel}>
+                  Passagens
+                </Text>
+                <Text style={styles.resumoValor}>
+                  R$ {previaFinanceira.valorPassagens.toFixed(2)}
+                </Text>
+              </View>
+
+              {previaFinanceira.valorAdicionais > 0 && (
+                <View style={styles.linhaResumo}>
+                  <Text style={styles.resumoLabel}>
+                    Refeições e adicionais
+                  </Text>
+                  <Text style={styles.resumoValor}>
+                    R$ {previaFinanceira.valorAdicionais.toFixed(2)}
+                  </Text>
+                </View>
+              )}
+
+              {previaFinanceira.taxaPassageiro > 0 && (
+                <View style={styles.linhaResumo}>
+                  <Text style={styles.resumoLabel}>
+                    Taxa Cadê Meu Barco
+                  </Text>
+                  <Text style={styles.resumoValor}>
+                    R$ {previaFinanceira.taxaPassageiro.toFixed(2)}
+                  </Text>
+                </View>
+              )}
+
+              <View style={styles.resumoDivisor} />
+              <Text style={styles.totalLabel}>
+                TOTAL A PAGAR
+              </Text>
+              <Text style={styles.totalValue}>
+                R$ {totalGeral.toFixed(2)}
+              </Text>
+              <Text style={styles.totalAviso}>
+                O valor oficial será validado no servidor antes
+                da geração do Pix.
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={[
+                styles.btnFinalizar,
+                vendaForaDoPrazo() &&
+                  styles.btnFinalizarDesativado,
+              ]}
+              onPress={handleGerarPix}
+              disabled={carregando || vendaForaDoPrazo()}
+            >
+              {carregando ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.btnFinalizarText}>
+                  {vendaForaDoPrazo()
+                    ? "VENDAS ENCERRADAS"
+                    : "GERAR PAGAMENTO PIX"}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </>
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#020617", paddingHorizontal: 20 },
+  center: {
+    flex: 1,
+    backgroundColor: "#020617",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  indisponivelTitulo: {
+    color: "#fff",
+    fontSize: 22,
+    fontWeight: "900",
+    marginTop: 18,
+  },
+  indisponivelTexto: {
+    color: "#94a3b8",
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: "center",
+    marginTop: 8,
+  },
+  btnVoltar: {
+    marginTop: 24,
+    backgroundColor: "#38bdf8",
+    paddingHorizontal: 22,
+    paddingVertical: 14,
+    borderRadius: 14,
+  },
+  btnVoltarTexto: {
+    color: "#082f49",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  cardInfo: {
+    backgroundColor: "#0f172a",
+    padding: 20,
+    borderRadius: 20,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+  },
+  barcoTitle: { color: "#fff", fontSize: 20, fontWeight: "bold" },
+  rotaText: {
+    color: "#38bdf8",
+    fontSize: 14,
+    fontWeight: "bold",
+    marginTop: 5,
+  },
+  divider: { height: 1, backgroundColor: "#1e293b", marginVertical: 12 },
+  subText: { color: "#94a3b8", fontSize: 13 },
+  sectionTitle: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "900",
+    marginBottom: 15,
+    marginTop: 10,
+    letterSpacing: 1,
+  },
+  avisoPrivacidade: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 10,
+    backgroundColor: "rgba(56, 189, 248, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.25)",
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+  },
+  avisoPrivacidadeTexto: {
+    flex: 1,
+    color: "#cbd5e1",
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  perfilCidadeBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "rgba(16, 185, 129, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(16, 185, 129, 0.25)",
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
+  },
+  perfilCidadeBoxAlerta: {
+    backgroundColor: "rgba(251, 191, 36, 0.08)",
+    borderColor: "rgba(251, 191, 36, 0.35)",
+  },
+  perfilCidadeTitulo: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "900",
+    marginBottom: 2,
+  },
+  perfilCidadeTexto: {
+    color: "#cbd5e1",
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  btnCompletarPerfil: {
+    backgroundColor: "#fbbf24",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 10,
+  },
+  btnCompletarPerfilTexto: {
+    color: "#020617",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  rowOptions: { flexDirection: "row", gap: 10, marginBottom: 20 },
+  optionBtn: {
+    flex: 1,
+    backgroundColor: "#0f172a",
+    padding: 15,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    alignItems: "center",
+  },
+  optionBtnActive: {
+    borderColor: "#38bdf8",
+    backgroundColor: "rgba(56, 189, 248, 0.05)",
+  },
+  optionLabel: {
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: "bold",
+    marginBottom: 5,
+  },
+  optionPrice: { color: "#fff", fontSize: 13, fontWeight: "bold" },
+  cardPassageiro: {
+    backgroundColor: "#0f172a",
+    padding: 15,
+    borderRadius: 15,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+  },
+  headerPass: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 15,
+  },
+  passNum: { color: "#38bdf8", fontSize: 11, fontWeight: "bold" },
+  input: {
+    backgroundColor: "#1e293b",
+    padding: 14,
+    borderRadius: 12,
+    color: "#fff",
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: "#334155",
+  },
+  btnAdd: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    padding: 15,
+    borderStyle: "dashed",
+    borderWidth: 1,
+    borderColor: "#38bdf8",
+    borderRadius: 12,
+    marginBottom: 20,
+  },
+  btnAddText: { color: "#38bdf8", fontSize: 12, fontWeight: "bold" },
+  cardTotal: {
+    backgroundColor: "#0f172a",
+    padding: 20,
+    borderRadius: 20,
+    alignItems: "center",
+    marginBottom: 20,
+    borderLeftWidth: 5,
+    borderLeftColor: "#10b981",
+  },
+  linhaResumo: {
+    width: "100%",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 9,
+  },
+  resumoLabel: {
+    color: "#94a3b8",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  resumoValor: {
+    color: "#e2e8f0",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  resumoDivisor: {
+    width: "100%",
+    height: 1,
+    backgroundColor: "#334155",
+    marginVertical: 10,
+  },
+  totalLabel: { color: "#64748b", fontSize: 10, fontWeight: "bold" },
+  totalValue: {
+    color: "#10b981",
+    fontSize: 30,
+    fontWeight: "900",
+    marginTop: 5,
+  },
+  totalAviso: {
+    color: "#64748b",
+    fontSize: 10,
+    lineHeight: 14,
+    textAlign: "center",
+    marginTop: 8,
+  },
+  btnFinalizar: {
+    backgroundColor: "#10b981",
+    padding: 20,
+    borderRadius: 15,
+    alignItems: "center",
+  },
+  btnFinalizarDesativado: {
+    backgroundColor: "#475569",
+  },
+  btnFinalizarText: { color: "#fff", fontWeight: "bold", fontSize: 16 },
+  cardPix: {
+    backgroundColor: "#0f172a",
+    padding: 30,
+    borderRadius: 30,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#10b981",
+  },
+  pixTitle: {
+    color: "#10b981",
+    fontWeight: "bold",
+    fontSize: 18,
+    marginTop: 15,
+  },
+  pixValor: {
+    color: "#fff",
+    fontSize: 24,
+    fontWeight: "900",
+    marginTop: 6,
+    marginBottom: 15,
+  },
+  qrCode: { width: 220, height: 220, borderRadius: 15, marginBottom: 20 },
+  btnCopy: {
+    backgroundColor: "#38bdf8",
+    width: "100%",
+    padding: 18,
+    borderRadius: 15,
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "center",
+  },
+  btnCopyText: { color: "#0f172a", fontWeight: "bold" },
+  btnVerificar: { marginTop: 20, padding: 10 },
+  btnVerificarText: {
+    color: "#38bdf8",
+    fontSize: 12,
+    fontWeight: "bold",
+    textDecorationLine: "underline",
+  },
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(2, 6, 23, 0.98)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 30,
+  },
+  modalFeedback: {
+    backgroundColor: "#0f172a",
+    padding: 30,
+    borderRadius: 30,
+    alignItems: "center",
+    width: "100%",
+    borderWidth: 1,
+    borderColor: "#1e293b",
+  },
+  modalTitle: {
+    color: "#fff",
+    fontSize: 20,
+    fontWeight: "bold",
+    marginTop: 15,
+  },
+  modalSub: {
+    color: "#94a3b8",
+    textAlign: "center",
+    marginTop: 10,
+    marginBottom: 25,
+  },
+  btnModalClose: {
+    backgroundColor: "#1e293b",
+    width: "100%",
+    padding: 15,
+    borderRadius: 15,
+    alignItems: "center",
+    marginTop: 10,
+  },
+  btnModalCloseText: { color: "#38bdf8", fontWeight: "bold" },
+});

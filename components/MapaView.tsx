@@ -1,0 +1,4493 @@
+import { FontAwesome5, Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  collection,
+  doc,
+  documentId,
+  query as firestoreQuery,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  where,
+} from "firebase/firestore";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  ActivityIndicator,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  useWindowDimensions,
+  View,
+} from "react-native";
+import MapView, {
+  Circle,
+  Marker,
+  Polyline,
+  PROVIDER_GOOGLE,
+} from "react-native-maps";
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withSequence,
+  withTiming,
+} from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import BarcoIcon from "../assets/BarcoIcon";
+import { db } from "../services/firebase";
+import {
+  determinarProgressoRota,
+  inferirSentidoDaViagem,
+  obterVelocidadeOficialKmh,
+} from "../services/navegacaoInteligente";
+import {
+  calcularEstadoOperacionalViagem,
+  montarProgramacoesLegadas,
+  normalizarProgramacaoViagem,
+  type ProgramacaoViagem,
+} from "../services/programacaoViagens";
+
+const cmbLightMapStyle = [
+  {
+    featureType: "all",
+    elementType: "labels",
+    stylers: [{ visibility: "off" }],
+  },
+  {
+    featureType: "landscape",
+    elementType: "geometry",
+    stylers: [{ color: "#edf4ef" }],
+  },
+  {
+    featureType: "landscape.natural",
+    elementType: "geometry",
+    stylers: [{ color: "#e3eee8" }],
+  },
+  {
+    featureType: "administrative.locality",
+    elementType: "labels.text.fill",
+    stylers: [{ visibility: "on" }, { color: "#1e3a4a" }, { weight: 1.2 }],
+  },
+  {
+    featureType: "administrative.locality",
+    elementType: "labels.text.stroke",
+    stylers: [{ visibility: "on" }, { color: "#f8fafc" }, { weight: 3.5 }],
+  },
+  {
+    featureType: "administrative.province",
+    elementType: "geometry.stroke",
+    stylers: [{ visibility: "on" }, { color: "#a8c0b5" }, { weight: 0.5 }],
+  },
+  {
+    featureType: "administrative.country",
+    elementType: "geometry.stroke",
+    stylers: [{ visibility: "on" }, { color: "#819e91" }, { weight: 0.7 }],
+  },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "road", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+  {
+    featureType: "water",
+    elementType: "geometry",
+    stylers: [{ color: "#8fd3e8" }],
+  },
+  {
+    featureType: "water",
+    elementType: "labels",
+    stylers: [{ visibility: "off" }],
+  },
+];
+
+const calcularDistanciaKm = (
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+) => {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * (Math.PI / 180)) *
+      Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+};
+
+const formatarTempo = (minutosTotais: number) => {
+  if (!Number.isFinite(minutosTotais) || minutosTotais <= 0)
+    return "calculando";
+  if (minutosTotais < 60) return `${Math.round(minutosTotais)} min`;
+  const horas = Math.floor(minutosTotais / 60);
+  const minutos = Math.round(minutosTotais % 60);
+  return minutos > 0 ? `${horas}h ${minutos}min` : `${horas}h`;
+};
+
+const LIMITES_OPERACIONAIS_AM_PA = {
+  minLat: -10.8,
+  maxLat: 4.8,
+  // horizontal: do Acre até o Maranhão
+  minLng: -75.5,
+  maxLng: -41.0,
+};
+
+const REGIAO_INICIAL_AM_PA = {
+  latitude: -4.2,
+  longitude: -58.3,
+  latitudeDelta: 16,
+  longitudeDelta: 34,
+};
+
+const limitarRegiaoOperacional = (region: any) => {
+  const latitudeDelta = Math.min(
+    Math.max(Number(region.latitudeDelta || 16), 0.01),
+    18,
+  );
+  const longitudeDelta = Math.min(
+    Math.max(Number(region.longitudeDelta || 34), 0.01),
+    36,
+  );
+
+  return {
+    ...region,
+    latitude: Math.min(
+      Math.max(
+        Number(region.latitude || REGIAO_INICIAL_AM_PA.latitude),
+        LIMITES_OPERACIONAIS_AM_PA.minLat,
+      ),
+      LIMITES_OPERACIONAIS_AM_PA.maxLat,
+    ),
+    longitude: Math.min(
+      Math.max(
+        Number(region.longitude || REGIAO_INICIAL_AM_PA.longitude),
+        LIMITES_OPERACIONAIS_AM_PA.minLng,
+      ),
+      LIMITES_OPERACIONAIS_AM_PA.maxLng,
+    ),
+    latitudeDelta,
+    longitudeDelta,
+  };
+};
+
+const regiaoFoiLimitada = (original: any, limitada: any) => {
+  return (
+    Math.abs(Number(original.latitude) - Number(limitada.latitude)) > 0.0001 ||
+    Math.abs(Number(original.longitude) - Number(limitada.longitude)) >
+      0.0001 ||
+    Math.abs(Number(original.latitudeDelta) - Number(limitada.latitudeDelta)) >
+      0.0001 ||
+    Math.abs(
+      Number(original.longitudeDelta) - Number(limitada.longitudeDelta),
+    ) > 0.0001
+  );
+};
+
+const obterVelocidadeOperacionalKmh = (barcoFoco: any) => {
+  return obterVelocidadeOficialKmh(barcoFoco) ?? 0;
+};
+
+const obterIconeClima = (
+  condicao: string,
+  codigoIcone: string,
+): React.ComponentProps<typeof Ionicons>["name"] => {
+  const chave = String(condicao || "").toLowerCase();
+
+  if (chave.includes("thunder")) return "thunderstorm-outline";
+  if (chave.includes("rain") || chave.includes("drizzle")) {
+    return "rainy-outline";
+  }
+  if (chave.includes("snow")) return "snow-outline";
+  if (
+    chave.includes("mist") ||
+    chave.includes("fog") ||
+    chave.includes("haze") ||
+    chave.includes("smoke")
+  ) {
+    return "cloudy-outline";
+  }
+  if (chave.includes("cloud")) return "cloudy-outline";
+  if (chave.includes("clear") && String(codigoIcone).endsWith("n")) {
+    return "moon-outline";
+  }
+  if (chave.includes("clear")) return "sunny-outline";
+
+  return "partly-sunny-outline";
+};
+
+const calcularEtaMinutosPorDistancia = (distKm: number, barcoFoco: any) => {
+  const velocidadeKmh = obterVelocidadeOperacionalKmh(barcoFoco);
+
+  if (
+    !Number.isFinite(distKm) ||
+    distKm < 0 ||
+    !Number.isFinite(velocidadeKmh) ||
+    velocidadeKmh <= 0
+  ) {
+    return null;
+  }
+
+  return Math.max(1, Math.round((distKm / velocidadeKmh) * 60));
+};
+
+const calcularPrevisaoAteCoordenada = (
+  barcoFoco: any,
+  destinoLat: number,
+  destinoLng: number,
+) => {
+  const bLat = Number(barcoFoco?.ultima_posicao?.latitude);
+  const bLng = Number(barcoFoco?.ultima_posicao?.longitude);
+  const pLat = Number(destinoLat);
+  const pLng = Number(destinoLng);
+
+  if ([bLat, bLng, pLat, pLng].some((v) => !Number.isFinite(v) || v === 0)) {
+    return null;
+  }
+
+  const distKm = calcularDistanciaKm(bLat, bLng, pLat, pLng);
+  const minutos = calcularEtaMinutosPorDistancia(distKm, barcoFoco);
+
+  if (minutos === null) return null;
+
+  return {
+    km: distKm.toFixed(1),
+    minutos,
+    tempo: formatarTempo(minutos),
+  };
+};
+
+const normalizarTextoRotaOficial = (valor: any) => {
+  return String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/⚓/g, "")
+    .replace(/_/g, " ")
+    .replace(/^PORTO\s+(DE|DA|DO|DOS|DAS)?\s*/gi, "")
+    .replace(/^TERMINAL\s+(DE|DA|DO|DOS|DAS)?\s*/gi, "")
+    .replace(/\s*[-/]\s*[A-Z]{2}$/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+};
+
+const textosCombinamRotaOficial = (a: any, b: any) => {
+  const na = normalizarTextoRotaOficial(a);
+  const nb = normalizarTextoRotaOficial(b);
+
+  if (!na || !nb) return false;
+
+  return na === nb || na.includes(nb) || nb.includes(na);
+};
+
+const calcularDistanciaRestantePelaRota = (
+  barcoFoco: any,
+  pontosRota: { latitude: number; longitude: number }[],
+) => {
+  const bLat = Number(barcoFoco?.ultima_posicao?.latitude);
+  const bLng = Number(barcoFoco?.ultima_posicao?.longitude);
+
+  if (
+    !Number.isFinite(bLat) ||
+    !Number.isFinite(bLng) ||
+    bLat === 0 ||
+    bLng === 0 ||
+    pontosRota.length < 2
+  ) {
+    return null;
+  }
+
+  let indiceMaisProximo = 0;
+  let menorDistancia = Infinity;
+
+  pontosRota.forEach((ponto, index) => {
+    const distancia = calcularDistanciaKm(
+      bLat,
+      bLng,
+      ponto.latitude,
+      ponto.longitude,
+    );
+
+    if (distancia < menorDistancia) {
+      menorDistancia = distancia;
+      indiceMaisProximo = index;
+    }
+  });
+
+  let distanciaRestante = menorDistancia;
+
+  for (let i = indiceMaisProximo; i < pontosRota.length - 1; i++) {
+    distanciaRestante += calcularDistanciaKm(
+      pontosRota[i].latitude,
+      pontosRota[i].longitude,
+      pontosRota[i + 1].latitude,
+      pontosRota[i + 1].longitude,
+    );
+  }
+
+  const minutos = calcularEtaMinutosPorDistancia(distanciaRestante, barcoFoco);
+
+  if (minutos === null) return null;
+
+  return {
+    km: distanciaRestante.toFixed(1),
+    minutos,
+    tempo: formatarTempo(minutos),
+    indiceMaisProximo,
+  };
+};
+
+// --- COMPONENTE RADAR ---
+// --- COMPONENTE RADAR PREMIUM ---
+const RadarNativo = ({ lat, lng, rgb, zoomDelta }: any) => {
+  const [progresso, setProgresso] = useState(0);
+
+  useEffect(() => {
+    const radar = setInterval(() => {
+      setProgresso((p) => (p >= 1 ? 0 : p + 0.018));
+    }, 50);
+
+    return () => clearInterval(radar);
+  }, []);
+
+  const zoomSeguro = Number(zoomDelta || 0.1);
+
+  // Pulso mais visível no celular, parecido com o efeito do web
+  const maxRadius = Math.max(140, Math.min(9000, zoomSeguro * 111000 * 0.065));
+  return (
+    <>
+      {[...Array(5)].map((_, i) => {
+        const atraso = i * 0.18;
+        let progressoAtual = progresso + atraso;
+
+        if (progressoAtual > 1) progressoAtual -= 1;
+
+        const radius = Math.max(8, progressoAtual * maxRadius);
+        const opacity = Math.max(0, 0.9 - progressoAtual * 0.9);
+        return (
+          <Circle
+            key={i}
+            center={{ latitude: lat, longitude: lng }}
+            radius={radius}
+            strokeWidth={5}
+            strokeColor={`rgba(${rgb}, ${opacity})`}
+            fillColor={`rgba(${rgb}, ${opacity * 0.1})`}
+            zIndex={1}
+          />
+        );
+      })}
+    </>
+  );
+};
+
+type NivelVisualPorto = "distante" | "medio" | "proximo";
+
+const obterNivelVisualPortos = (latitudeDelta: number): NivelVisualPorto => {
+  const delta = Number(latitudeDelta || REGIAO_INICIAL_AM_PA.latitudeDelta);
+
+  if (delta >= 3.5) return "distante";
+  if (delta >= 0.8) return "medio";
+  return "proximo";
+};
+
+const obterNomeCidadePorto = (portoBase: any) => {
+  return String(
+    portoBase?.cidade ||
+      portoBase?.municipio ||
+      portoBase?.coordenadas?.cidade ||
+      portoBase?.coordenadas?.municipio ||
+      portoBase?.coordenadas?.nome ||
+      portoBase?.nome ||
+      "PORTO",
+  ).trim();
+};
+
+const PortoMarker = ({
+  nomeCidade,
+  ativo,
+  nivel,
+}: {
+  nomeCidade?: string;
+  ativo?: boolean;
+  nivel: NivelVisualPorto;
+}) => {
+  if (!ativo && nivel === "distante") {
+    return (
+      <View
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: 4,
+          backgroundColor: "#fbbf24",
+          borderWidth: 1,
+          borderColor: "rgba(2, 6, 23, 0.9)",
+          opacity: 0.82,
+        }}
+      />
+    );
+  }
+
+  const tamanhoContainer = ativo ? 34 : nivel === "medio" ? 20 : 26;
+  const tamanhoIcone = ativo ? 17 : nivel === "medio" ? 10 : 13;
+  const larguraBorda = ativo ? 2 : 1;
+
+  return (
+    <View
+      style={{
+        alignItems: "center",
+        justifyContent: "center",
+        overflow: "visible",
+      }}
+    >
+      {ativo && (
+        <View style={styles.portoNomeBadge}>
+          <Text style={styles.portoNomeTexto} numberOfLines={1}>
+            {String(nomeCidade || "PORTO").toUpperCase()}
+          </Text>
+        </View>
+      )}
+
+      <View
+        style={{
+          width: tamanhoContainer,
+          height: tamanhoContainer,
+          borderRadius: tamanhoContainer / 2,
+          backgroundColor: ativo ? "#fbbf24" : "rgba(15, 23, 42, 0.94)",
+          borderWidth: larguraBorda,
+          borderColor: ativo ? "#ffffff" : "rgba(251, 191, 36, 0.9)",
+          alignItems: "center",
+          justifyContent: "center",
+          shadowColor: ativo ? "#fbbf24" : "#000000",
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: ativo ? 0.7 : 0.22,
+          shadowRadius: ativo ? 8 : 3,
+          elevation: ativo ? 10 : 4,
+        }}
+      >
+        <FontAwesome5
+          name="anchor"
+          size={tamanhoIcone}
+          color={ativo ? "#020617" : "#fbbf24"}
+        />
+      </View>
+    </View>
+  );
+};
+
+const limparCoordenadasRota = (rota: any[] = []) => {
+  return rota
+    .map((p: any) => {
+      const valorData =
+        p.criadoEmMs ??
+        p.timestampMs ??
+        p.criado_em ??
+        p.criadoEm ??
+        p.timestamp;
+      let criadoEmMs = Number(valorData);
+
+      if (!Number.isFinite(criadoEmMs) || criadoEmMs <= 0) {
+        const data = new Date(valorData);
+        criadoEmMs = Number.isNaN(data.getTime()) ? 0 : data.getTime();
+      }
+
+      return {
+        latitude: Number(p.latitude ?? p.lat),
+        longitude: Number(p.longitude ?? p.lng),
+        ...(criadoEmMs > 0 ? { criadoEmMs } : {}),
+      };
+    })
+    .filter(
+      (p) =>
+        !isNaN(p.latitude) &&
+        !isNaN(p.longitude) &&
+        p.latitude !== 0 &&
+        p.longitude !== 0,
+    );
+};
+
+const encontrarIndiceMaisProximoNaRota = (
+  pontos: CoordenadaRastro[],
+  latitude: number,
+  longitude: number,
+) => {
+  if (pontos.length === 0) return -1;
+
+  let indice = 0;
+  let menorDistancia = Number.POSITIVE_INFINITY;
+
+  pontos.forEach((ponto, atual) => {
+    const distancia = calcularDistanciaKm(
+      latitude,
+      longitude,
+      ponto.latitude,
+      ponto.longitude,
+    );
+
+    if (distancia < menorDistancia) {
+      menorDistancia = distancia;
+      indice = atual;
+    }
+  });
+
+  return indice;
+};
+
+const montarTrajetoPartidaAteAtual = ({
+  rotaOficial,
+  rastroReal,
+  rotaDocumento,
+  latitudeAtual,
+  longitudeAtual,
+}: {
+  rotaOficial: CoordenadaRastro[];
+  rastroReal: CoordenadaRastro[];
+  rotaDocumento: CoordenadaRastro[];
+  latitudeAtual: number;
+  longitudeAtual: number;
+}) => {
+  const posicaoAtualValida =
+    Number.isFinite(latitudeAtual) &&
+    Number.isFinite(longitudeAtual) &&
+    latitudeAtual !== 0 &&
+    longitudeAtual !== 0;
+
+  const rotaReferencia =
+    rotaOficial.length > 1
+      ? rotaOficial
+      : rotaDocumento.length > 1
+        ? rotaDocumento
+        : [];
+
+  let resultado: CoordenadaRastro[] = [];
+
+  if (rastroReal.length > 1) {
+    if (rotaReferencia.length > 1) {
+      const primeiroRastro = rastroReal[0];
+      const indiceLigacao = encontrarIndiceMaisProximoNaRota(
+        rotaReferencia,
+        primeiroRastro.latitude,
+        primeiroRastro.longitude,
+      );
+
+      resultado =
+        indiceLigacao >= 0
+          ? [...rotaReferencia.slice(0, indiceLigacao + 1), ...rastroReal]
+          : [...rastroReal];
+    } else {
+      resultado = [...rastroReal];
+    }
+  } else if (rotaReferencia.length > 1 && posicaoAtualValida) {
+    const indiceAtual = encontrarIndiceMaisProximoNaRota(
+      rotaReferencia,
+      latitudeAtual,
+      longitudeAtual,
+    );
+
+    resultado =
+      indiceAtual >= 0
+        ? rotaReferencia.slice(0, indiceAtual + 1)
+        : [...rotaReferencia];
+  }
+
+  if (posicaoAtualValida) {
+    const ultimo = resultado[resultado.length - 1];
+    const jaContemAtual =
+      ultimo &&
+      Math.abs(ultimo.latitude - latitudeAtual) < 0.00001 &&
+      Math.abs(ultimo.longitude - longitudeAtual) < 0.00001;
+
+    if (!jaContemAtual) {
+      resultado.push({
+        latitude: latitudeAtual,
+        longitude: longitudeAtual,
+      });
+    }
+  }
+
+  return otimizarPontosDoRastro(resultado, 180, 0.025);
+};
+
+const suavizarMovimento = (t: number) => 1 - Math.pow(1 - t, 3);
+
+const limitarNumero = (valor: number, minimo: number, maximo: number) => {
+  return Math.min(maximo, Math.max(minimo, valor));
+};
+
+const converterDataMovimentoMs = (valor: any): number => {
+  try {
+    if (typeof valor?.toMillis === "function") return valor.toMillis();
+    if (typeof valor?.toDate === "function") return valor.toDate().getTime();
+    if (typeof valor?.seconds === "number") return valor.seconds * 1000;
+
+    const data = new Date(valor);
+    return Number.isNaN(data.getTime()) ? 0 : data.getTime();
+  } catch {
+    return 0;
+  }
+};
+
+const obterTimestampPosicaoMs = (barcoBase: any) => {
+  const posicao = barcoBase?.ultima_posicao || {};
+
+  return (
+    converterDataMovimentoMs(
+      posicao.visto_por_ultimo ??
+        posicao.atualizado_em ??
+        posicao.atualizadoEm ??
+        posicao.criado_em ??
+        posicao.criadoEm ??
+        posicao.timestamp,
+    ) || Date.now()
+  );
+};
+
+const obterIntervaloEnvioSegundos = (barcoBase: any) => {
+  const candidatos = [
+    barcoBase?.intervaloEnvioAtualSegundos,
+    barcoBase?.rastreadorStatus?.intervaloEnvioAtualSegundos,
+    barcoBase?.statusRastreador?.intervaloEnvioAtualSegundos,
+    barcoBase?.telemetria?.intervaloEnvioAtualSegundos,
+    barcoBase?.rastreador?.intervaloEnvioAtualSegundos,
+  ];
+
+  const encontrado = candidatos
+    .map(Number)
+    .find((valor) => Number.isFinite(valor) && valor >= 3 && valor <= 120);
+
+  return encontrado || null;
+};
+
+const calcularRumoGraus = (
+  origem: { latitude: number; longitude: number },
+  destino: { latitude: number; longitude: number },
+) => {
+  const lat1 = (origem.latitude * Math.PI) / 180;
+  const lat2 = (destino.latitude * Math.PI) / 180;
+  const dLon = ((destino.longitude - origem.longitude) * Math.PI) / 180;
+
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+};
+
+const calcularDiferencaAngularGraus = (a: number, b: number) => {
+  const diferenca = Math.abs((((a - b) % 360) + 360) % 360);
+  return Math.min(diferenca, 360 - diferenca);
+};
+
+const calcularTempoProjetadoSeguro = (
+  idadeSegundos: number,
+  intervaloSegundos: number,
+) => {
+  const intervalo = limitarNumero(intervaloSegundos, 5, 40);
+  const trechoNormal = intervalo * 0.82;
+
+  if (idadeSegundos <= trechoNormal) return Math.max(0, idadeSegundos);
+
+  // Depois de aproximadamente 82% do intervalo previsto, o barco reduz
+  // suavemente a projeção. Assim ele se aproxima do próximo ponto sem
+  // ultrapassá-lo e sem precisar voltar para trás quando o GPS atualizar.
+  const excedente = Math.min(
+    Math.max(0, idadeSegundos - trechoNormal),
+    intervalo * 0.38,
+  );
+
+  return trechoNormal + excedente * 0.2;
+};
+
+const projetarCoordenada = (
+  origem: { latitude: number; longitude: number },
+  rumoGraus: number,
+  distanciaKm: number,
+) => {
+  if (
+    !Number.isFinite(rumoGraus) ||
+    !Number.isFinite(distanciaKm) ||
+    distanciaKm <= 0
+  ) {
+    return origem;
+  }
+
+  const raioTerraKm = 6371;
+  const distanciaAngular = distanciaKm / raioTerraKm;
+  const rumo = (rumoGraus * Math.PI) / 180;
+  const lat1 = (origem.latitude * Math.PI) / 180;
+  const lon1 = (origem.longitude * Math.PI) / 180;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(distanciaAngular) +
+      Math.cos(lat1) * Math.sin(distanciaAngular) * Math.cos(rumo),
+  );
+
+  const lon2 =
+    lon1 +
+    Math.atan2(
+      Math.sin(rumo) * Math.sin(distanciaAngular) * Math.cos(lat1),
+      Math.cos(distanciaAngular) - Math.sin(lat1) * Math.sin(lat2),
+    );
+
+  return {
+    latitude: (lat2 * 180) / Math.PI,
+    longitude: (((lon2 * 180) / Math.PI + 540) % 360) - 180,
+  };
+};
+
+const interpolarCoordenada = (
+  origem: { latitude: number; longitude: number },
+  destino: { latitude: number; longitude: number },
+  progresso: number,
+) => {
+  const t = limitarNumero(progresso, 0, 1);
+
+  return {
+    latitude: origem.latitude + (destino.latitude - origem.latitude) * t,
+    longitude: origem.longitude + (destino.longitude - origem.longitude) * t,
+  };
+};
+
+type PontoMovimentoBuffer = {
+  latitude: number;
+  longitude: number;
+  timestampMs: number;
+  recebidaEmMs: number;
+  intervaloSegundos: number;
+};
+
+type SegmentoMovimentoBuffer = {
+  origem: PontoMovimentoBuffer;
+  destino: PontoMovimentoBuffer;
+  inicioMs: number;
+  duracaoMs: number;
+};
+
+const calcularDuracaoSegmentoBufferMs = (
+  origem: PontoMovimentoBuffer,
+  destino: PontoMovimentoBuffer,
+) => {
+  const intervaloTimestamp = (destino.timestampMs - origem.timestampMs) / 1000;
+  const intervaloRecebimento =
+    (destino.recebidaEmMs - origem.recebidaEmMs) / 1000;
+
+  const intervaloObservado =
+    Number.isFinite(intervaloTimestamp) &&
+    intervaloTimestamp >= 2 &&
+    intervaloTimestamp <= 90
+      ? intervaloTimestamp
+      : intervaloRecebimento;
+
+  const intervaloSeguro =
+    Number.isFinite(intervaloObservado) &&
+    intervaloObservado >= 2 &&
+    intervaloObservado <= 90
+      ? intervaloObservado
+      : destino.intervaloSegundos || origem.intervaloSegundos || 15;
+
+  return limitarNumero(intervaloSeguro, 3, 45) * 1000;
+};
+
+const BarcoMarkerSuave = ({
+  b,
+  isAtivo,
+  statusSinal,
+  deveEspelhar,
+  zoomAtual,
+  onCoordenadaVisualChange,
+}: any) => {
+  const lat = Number(b?.ultima_posicao?.latitude);
+  const lng = Number(b?.ultima_posicao?.longitude);
+  const timestampPosicaoMs = obterTimestampPosicaoMs(b);
+
+  const coordenadaValida =
+    Number.isFinite(lat) && Number.isFinite(lng) && lat !== 0 && lng !== 0;
+
+  const destinoInicial = {
+    latitude: coordenadaValida ? lat : 0,
+    longitude: coordenadaValida ? lng : 0,
+  };
+
+  const [coordenadaAtual, setCoordenadaAtual] = useState(destinoInicial);
+
+  const visualRef = useRef(destinoInicial);
+  const filaPontosRef = useRef<PontoMovimentoBuffer[]>([]);
+  const segmentoRef = useRef<SegmentoMovimentoBuffer | null>(null);
+  const barcoIdRef = useRef(String(b?.id || ""));
+  const ultimaCoordenadaEmitidaRef = useRef<{
+    latitude: number;
+    longitude: number;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!isAtivo || typeof onCoordenadaVisualChange !== "function") {
+      return;
+    }
+
+    const emitirCoordenadaVisual = () => {
+      const atual = visualRef.current;
+      const anterior = ultimaCoordenadaEmitidaRef.current;
+
+      const mudouMetros = anterior
+        ? calcularDistanciaKm(
+            anterior.latitude,
+            anterior.longitude,
+            atual.latitude,
+            atual.longitude,
+          ) * 1000
+        : Number.POSITIVE_INFINITY;
+
+      if (mudouMetros < 0.5) return;
+
+      ultimaCoordenadaEmitidaRef.current = {
+        latitude: atual.latitude,
+        longitude: atual.longitude,
+      };
+
+      onCoordenadaVisualChange({
+        latitude: atual.latitude,
+        longitude: atual.longitude,
+      });
+    };
+
+    emitirCoordenadaVisual();
+    const timer = setInterval(emitirCoordenadaVisual, 160);
+
+    return () => clearInterval(timer);
+  }, [b?.id, isAtivo, onCoordenadaVisualChange]);
+
+  const iniciarProximoSegmento = useCallback(() => {
+    if (segmentoRef.current || filaPontosRef.current.length < 2) return;
+
+    const origem = filaPontosRef.current[0];
+    const destino = filaPontosRef.current[1];
+
+    const distanciaKm = calcularDistanciaKm(
+      origem.latitude,
+      origem.longitude,
+      destino.latitude,
+      destino.longitude,
+    );
+
+    // Salto impossível de GPS: não desenha uma travessia brusca pelo mapa.
+    if (!Number.isFinite(distanciaKm) || distanciaKm > 10) {
+      filaPontosRef.current.shift();
+      visualRef.current = {
+        latitude: destino.latitude,
+        longitude: destino.longitude,
+      };
+      setCoordenadaAtual(visualRef.current);
+      iniciarProximoSegmento();
+      return;
+    }
+
+    segmentoRef.current = {
+      origem: {
+        ...origem,
+        latitude: visualRef.current.latitude,
+        longitude: visualRef.current.longitude,
+      },
+      destino,
+      inicioMs: Date.now(),
+      duracaoMs: calcularDuracaoSegmentoBufferMs(origem, destino),
+    };
+  }, []);
+
+  useEffect(() => {
+    const barcoIdAtual = String(b?.id || "");
+
+    if (barcoIdRef.current === barcoIdAtual) return;
+
+    barcoIdRef.current = barcoIdAtual;
+    filaPontosRef.current = [];
+    segmentoRef.current = null;
+
+    if (coordenadaValida) {
+      visualRef.current = destinoInicial;
+      setCoordenadaAtual(destinoInicial);
+    }
+  }, [
+    b?.id,
+    coordenadaValida,
+    destinoInicial.latitude,
+    destinoInicial.longitude,
+  ]);
+
+  useEffect(() => {
+    if (!coordenadaValida) return;
+
+    const intervaloConfigurado = limitarNumero(
+      obterIntervaloEnvioSegundos(b) ?? 15,
+      3,
+      45,
+    );
+
+    const novoPonto: PontoMovimentoBuffer = {
+      latitude: lat,
+      longitude: lng,
+      timestampMs: timestampPosicaoMs,
+      recebidaEmMs: Date.now(),
+      intervaloSegundos: intervaloConfigurado,
+    };
+
+    const ultimoRecebido =
+      filaPontosRef.current[filaPontosRef.current.length - 1];
+
+    const pontoRepetido =
+      ultimoRecebido &&
+      Math.abs(ultimoRecebido.latitude - novoPonto.latitude) < 0.0000001 &&
+      Math.abs(ultimoRecebido.longitude - novoPonto.longitude) < 0.0000001 &&
+      ultimoRecebido.timestampMs === novoPonto.timestampMs;
+
+    if (pontoRepetido) return;
+
+    if (filaPontosRef.current.length === 0) {
+      filaPontosRef.current = [novoPonto];
+      visualRef.current = {
+        latitude: novoPonto.latitude,
+        longitude: novoPonto.longitude,
+      };
+      setCoordenadaAtual(visualRef.current);
+      return;
+    }
+
+    // Mantém no máximo alguns pontos reais na fila. O marcador visual sempre
+    // percorre um segmento já conhecido, ficando aproximadamente um ponto atrás.
+    filaPontosRef.current.push(novoPonto);
+
+    if (filaPontosRef.current.length > 5) {
+      filaPontosRef.current = filaPontosRef.current.slice(-5);
+      segmentoRef.current = null;
+      visualRef.current = {
+        latitude: filaPontosRef.current[0].latitude,
+        longitude: filaPontosRef.current[0].longitude,
+      };
+      setCoordenadaAtual(visualRef.current);
+    }
+
+    iniciarProximoSegmento();
+  }, [
+    b?.id,
+    coordenadaValida,
+    iniciarProximoSegmento,
+    lat,
+    lng,
+    timestampPosicaoMs,
+    b?.intervaloEnvioAtualSegundos,
+    b?.intervaloEnvioSegundos,
+    b?.rastreadorConfig?.intervaloEnvioAtualSegundos,
+  ]);
+
+  useEffect(() => {
+    const intervaloAnimacaoMs = isAtivo ? 80 : 150;
+
+    const animar = () => {
+      const segmento = segmentoRef.current;
+
+      if (!segmento) {
+        iniciarProximoSegmento();
+        return;
+      }
+
+      const progresso = limitarNumero(
+        (Date.now() - segmento.inicioMs) / Math.max(1, segmento.duracaoMs),
+        0,
+        1,
+      );
+
+      // Interpolação linear entre dois pontos reais conhecidos. Não há previsão
+      // de direção nem possibilidade de ultrapassar o próximo ponto.
+      const novaCoordenada = interpolarCoordenada(
+        segmento.origem,
+        segmento.destino,
+        progresso,
+      );
+
+      const distanciaVisualMetros =
+        calcularDistanciaKm(
+          visualRef.current.latitude,
+          visualRef.current.longitude,
+          novaCoordenada.latitude,
+          novaCoordenada.longitude,
+        ) * 1000;
+
+      if (distanciaVisualMetros >= 0.25 || progresso >= 1) {
+        visualRef.current = novaCoordenada;
+        setCoordenadaAtual(novaCoordenada);
+      }
+
+      if (progresso >= 1) {
+        visualRef.current = {
+          latitude: segmento.destino.latitude,
+          longitude: segmento.destino.longitude,
+        };
+        setCoordenadaAtual(visualRef.current);
+
+        // Remove somente o ponto de origem. O destino vira a origem do próximo
+        // segmento quando uma nova coordenada real estiver disponível.
+        filaPontosRef.current.shift();
+        segmentoRef.current = null;
+        iniciarProximoSegmento();
+      }
+    };
+
+    animar();
+    const timer = setInterval(animar, intervaloAnimacaoMs);
+
+    return () => clearInterval(timer);
+  }, [b?.id, iniciarProximoSegmento, isAtivo]);
+
+  if (!coordenadaValida) return null;
+
+  return (
+    <React.Fragment>
+      {isAtivo && statusSinal === "online" && (
+        <RadarNativo
+          lat={coordenadaAtual.latitude}
+          lng={coordenadaAtual.longitude}
+          rgb="6, 182, 212"
+          zoomDelta={zoomAtual}
+        />
+      )}
+
+      <Marker
+        coordinate={coordenadaAtual}
+        anchor={{ x: 0.5, y: 0.5 }}
+        zIndex={isAtivo ? 20 : 10}
+      >
+        <View
+          style={[
+            styles.iconBase,
+            isAtivo && { width: 30, height: 30 },
+            styles.markerRelativo,
+            {
+              opacity: statusSinal === "online" ? 1 : 0.4,
+            },
+          ]}
+        >
+          <BarcoIcon tamanho={isAtivo ? 28 : 22} espelhar={deveEspelhar} />
+
+          {statusSinal !== "online" && (
+            <View style={styles.badgeAlertaGlobal}>
+              <Ionicons name="alert-circle" size={10} color="#ef4444" />
+            </View>
+          )}
+        </View>
+      </Marker>
+    </React.Fragment>
+  );
+};
+
+const normalizarPortoValidacao = (valor: any) => {
+  return String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/⚓/g, "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .toUpperCase()
+    .trim();
+};
+
+const simplificarNomePortoValidacao = (valor: any) => {
+  return normalizarPortoValidacao(valor)
+    .replace(/^PORTO\s+(DE|DA|DO|DOS|DAS)?\s*/g, "")
+    .replace(/^TERMINAL\s+(DE|DA|DO|DOS|DAS)?\s*/g, "")
+    .replace(/^CIDADE\s+(DE|DA|DO|DOS|DAS)?\s*/g, "")
+    .replace(/\s*-\s*[A-Z]{2}$/g, "")
+    .replace(/\s*\/\s*[A-Z]{2}$/g, "")
+    .trim();
+};
+
+const nomesPortoSaoIguais = (nomeRota: any, nomeSelecionado: any) => {
+  const rotaCompleta = normalizarPortoValidacao(nomeRota);
+  const selecionadoCompleto = normalizarPortoValidacao(nomeSelecionado);
+  const rotaSimples = simplificarNomePortoValidacao(nomeRota);
+  const selecionadoSimples = simplificarNomePortoValidacao(nomeSelecionado);
+
+  if (!rotaSimples || !selecionadoSimples) return false;
+
+  return (
+    rotaCompleta === selecionadoCompleto ||
+    rotaSimples === selecionadoSimples ||
+    rotaSimples.includes(selecionadoSimples) ||
+    selecionadoSimples.includes(rotaSimples)
+  );
+};
+
+const extrairNomeDePortoDaRota = (item: any) => {
+  if (!item) return "";
+  if (typeof item === "string") return item;
+
+  return (
+    item.porto ||
+    item.nome ||
+    item.local ||
+    item.cidade ||
+    item.destino ||
+    item.origem ||
+    ""
+  );
+};
+
+const extrairNomesDoPortoSelecionado = (portoSelecionado: any) => {
+  if (!portoSelecionado) return [];
+
+  return [
+    portoSelecionado.nome,
+    portoSelecionado.porto,
+    portoSelecionado.cidade,
+    portoSelecionado.local,
+    portoSelecionado.id,
+    portoSelecionado.coordenadas?.nome,
+    portoSelecionado.coordenadas?.porto,
+    portoSelecionado.coordenadas?.cidade,
+  ].filter(Boolean);
+};
+
+const coletarPortosDoDocumentoDoBarco = (barcoBase: any) => {
+  const portos: string[] = [];
+
+  const adicionarRota = (rota: any) => {
+    if (!rota) return;
+
+    [rota.portoOrigem, rota.porto_origem, rota.origem].forEach((nome) => {
+      if (nome) portos.push(String(nome));
+    });
+
+    const escalas = rota.escalas || rota.itinerario || [];
+    if (Array.isArray(escalas)) {
+      escalas.forEach((escala: any) => {
+        const nome = extrairNomeDePortoDaRota(escala);
+        if (nome) portos.push(String(nome));
+      });
+    }
+  };
+
+  adicionarRota(barcoBase?.rotaIda);
+  adicionarRota(barcoBase?.rotaVolta);
+
+  return Array.from(new Set(portos.filter(Boolean)));
+};
+
+const barcoAtendePortoSelecionado = (barcoBase: any, portoSelecionado: any) => {
+  if (!barcoBase || !portoSelecionado) return true;
+
+  const portosDaRota = coletarPortosDoDocumentoDoBarco(barcoBase);
+  const nomesPortoSelecionado =
+    extrairNomesDoPortoSelecionado(portoSelecionado);
+
+  // Segurança: se o objeto do barco ainda chegou sem rotaIda/rotaVolta,
+  // não bloqueia o cálculo para evitar falso aviso de rota não atendida.
+  if (portosDaRota.length === 0 || nomesPortoSelecionado.length === 0) {
+    return true;
+  }
+
+  return portosDaRota.some((nomeRota) =>
+    nomesPortoSelecionado.some((nomeSelecionado) =>
+      nomesPortoSaoIguais(nomeRota, nomeSelecionado),
+    ),
+  );
+};
+
+type CoordenadaRastro = {
+  latitude: number;
+  longitude: number;
+  criadoEmMs?: number;
+};
+
+const converterDataRastroMs = (valor: any): number => {
+  try {
+    if (typeof valor?.toMillis === "function") return valor.toMillis();
+    if (typeof valor?.toDate === "function") return valor.toDate().getTime();
+    if (typeof valor?.seconds === "number") return valor.seconds * 1000;
+    const data = new Date(valor);
+    return Number.isNaN(data.getTime()) ? 0 : data.getTime();
+  } catch {
+    return 0;
+  }
+};
+
+function otimizarPontosDoRastro(
+  pontos: CoordenadaRastro[],
+  limite = 70,
+  distanciaMinimaKm = 0.05,
+): CoordenadaRastro[] {
+  if (pontos.length <= 2) return pontos;
+
+  const filtrados: CoordenadaRastro[] = [pontos[0]];
+
+  for (let i = 1; i < pontos.length - 1; i += 1) {
+    const anterior = filtrados[filtrados.length - 1];
+    const atual = pontos[i];
+    const distancia = calcularDistanciaKm(
+      anterior.latitude,
+      anterior.longitude,
+      atual.latitude,
+      atual.longitude,
+    );
+
+    if (distancia >= distanciaMinimaKm) filtrados.push(atual);
+  }
+
+  const ultimo = pontos[pontos.length - 1];
+  if (ultimo) filtrados.push(ultimo);
+
+  if (filtrados.length <= limite) return filtrados;
+
+  const resultado: CoordenadaRastro[] = [];
+  const passo = (filtrados.length - 1) / (limite - 1);
+
+  for (let i = 0; i < limite; i += 1) {
+    resultado.push(filtrados[Math.round(i * passo)]);
+  }
+
+  return resultado.filter(
+    (ponto, indice, lista) =>
+      indice === 0 ||
+      ponto.latitude !== lista[indice - 1].latitude ||
+      ponto.longitude !== lista[indice - 1].longitude,
+  );
+}
+
+const removerPontosIsoladosDoRastro = (
+  pontos: CoordenadaRastro[],
+): CoordenadaRastro[] => {
+  if (pontos.length < 3) return pontos;
+
+  const resultado: CoordenadaRastro[] = [pontos[0]];
+
+  for (let indice = 1; indice < pontos.length - 1; indice += 1) {
+    const anterior = resultado[resultado.length - 1];
+    const atual = pontos[indice];
+    const proximo = pontos[indice + 1];
+
+    const distanciaAnteriorAtual = calcularDistanciaKm(
+      anterior.latitude,
+      anterior.longitude,
+      atual.latitude,
+      atual.longitude,
+    );
+    const distanciaAtualProximo = calcularDistanciaKm(
+      atual.latitude,
+      atual.longitude,
+      proximo.latitude,
+      proximo.longitude,
+    );
+    const distanciaAnteriorProximo = calcularDistanciaKm(
+      anterior.latitude,
+      anterior.longitude,
+      proximo.latitude,
+      proximo.longitude,
+    );
+
+    const parecePontoIsolado =
+      distanciaAnteriorAtual > 3 &&
+      distanciaAtualProximo > 3 &&
+      distanciaAnteriorProximo <
+        Math.min(
+          2,
+          Math.max(distanciaAnteriorAtual, distanciaAtualProximo) * 0.25,
+        );
+
+    if (!parecePontoIsolado) {
+      resultado.push(atual);
+    }
+  }
+
+  resultado.push(pontos[pontos.length - 1]);
+  return resultado;
+};
+
+const separarSegmentosRastroSeguro = (
+  pontosOriginais: CoordenadaRastro[],
+): CoordenadaRastro[][] => {
+  const pontos = removerPontosIsoladosDoRastro(
+    pontosOriginais.filter(
+      (ponto) =>
+        Number.isFinite(ponto.latitude) &&
+        Number.isFinite(ponto.longitude) &&
+        ponto.latitude !== 0 &&
+        ponto.longitude !== 0,
+    ),
+  );
+
+  if (pontos.length < 2) return [];
+
+  const segmentos: CoordenadaRastro[][] = [];
+  let segmentoAtual: CoordenadaRastro[] = [pontos[0]];
+
+  for (let indice = 1; indice < pontos.length; indice += 1) {
+    const anterior = pontos[indice - 1];
+    const atual = pontos[indice];
+    const distanciaKm = calcularDistanciaKm(
+      anterior.latitude,
+      anterior.longitude,
+      atual.latitude,
+      atual.longitude,
+    );
+    const intervaloMs =
+      anterior.criadoEmMs && atual.criadoEmMs
+        ? Math.max(0, atual.criadoEmMs - anterior.criadoEmMs)
+        : 0;
+    const velocidadeCalculadaKmh =
+      intervaloMs > 0 ? distanciaKm / (intervaloMs / 3_600_000) : 0;
+
+    const saltoImpossivel =
+      distanciaKm > 35 ||
+      (intervaloMs <= 0 && distanciaKm > 8) ||
+      (intervaloMs > 0 && distanciaKm > 1 && velocidadeCalculadaKmh > 95) ||
+      (intervaloMs > 0 && intervaloMs < 60_000 && distanciaKm > 2.5);
+
+    const novaViagem = intervaloMs >= 8 * 60 * 60 * 1000;
+
+    if (saltoImpossivel || novaViagem) {
+      if (segmentoAtual.length > 1) {
+        segmentos.push(segmentoAtual);
+      }
+      segmentoAtual = [atual];
+      continue;
+    }
+
+    segmentoAtual.push(atual);
+  }
+
+  if (segmentoAtual.length > 1) {
+    segmentos.push(segmentoAtual);
+  }
+
+  return segmentos;
+};
+
+const escolherSegmentosDaViagemAtual = ({
+  pontos,
+  inicioViagemMs,
+  posicaoAtual,
+}: {
+  pontos: CoordenadaRastro[];
+  inicioViagemMs: number;
+  posicaoAtual: CoordenadaRastro | null;
+}) => {
+  const ordenados = [...pontos]
+    .filter(
+      (ponto) =>
+        !inicioViagemMs ||
+        !ponto.criadoEmMs ||
+        ponto.criadoEmMs >= inicioViagemMs - 2 * 60 * 60 * 1000,
+    )
+    .sort((a, b) => {
+      if (a.criadoEmMs && b.criadoEmMs) {
+        return a.criadoEmMs - b.criadoEmMs;
+      }
+      return 0;
+    });
+
+  const segmentos = separarSegmentosRastroSeguro(ordenados);
+
+  if (segmentos.length <= 1) {
+    return segmentos.map((segmento) =>
+      otimizarPontosDoRastro(segmento, 180, 0.02),
+    );
+  }
+
+  const pontuar = (segmento: CoordenadaRastro[]) => {
+    const ultimo = segmento[segmento.length - 1];
+    const ultimoMs = Number(ultimo?.criadoEmMs || 0);
+    const distanciaAtual = posicaoAtual
+      ? calcularDistanciaKm(
+          ultimo.latitude,
+          ultimo.longitude,
+          posicaoAtual.latitude,
+          posicaoAtual.longitude,
+        )
+      : Number.POSITIVE_INFINITY;
+    const pertoDaPosicaoAtual = posicaoAtual && distanciaAtual <= 25 ? 1 : 0;
+
+    return {
+      segmento,
+      ultimoMs,
+      distanciaAtual,
+      pertoDaPosicaoAtual,
+    };
+  };
+
+  const melhor = segmentos.map(pontuar).sort((a, b) => {
+    if (a.pertoDaPosicaoAtual !== b.pertoDaPosicaoAtual) {
+      return b.pertoDaPosicaoAtual - a.pertoDaPosicaoAtual;
+    }
+    if (a.ultimoMs !== b.ultimoMs) {
+      return b.ultimoMs - a.ultimoMs;
+    }
+    return a.distanciaAtual - b.distanciaAtual;
+  })[0];
+
+  return melhor ? [otimizarPontosDoRastro(melhor.segmento, 180, 0.02)] : [];
+};
+
+type ProjecaoVisualNoRastro = {
+  segmentoIndice: number;
+  pontoIndice: number;
+  coordenada: CoordenadaRastro;
+  distanciaKm: number;
+  progresso: number;
+};
+
+const projetarBarcoVisualNoSegmento = (
+  barcoVisual: CoordenadaRastro,
+  inicio: CoordenadaRastro,
+  fim: CoordenadaRastro,
+) => {
+  const deltaLongitude = fim.longitude - inicio.longitude;
+  const deltaLatitude = fim.latitude - inicio.latitude;
+  const denominador =
+    deltaLongitude * deltaLongitude + deltaLatitude * deltaLatitude;
+
+  const progresso =
+    denominador > 0
+      ? limitarNumero(
+          ((barcoVisual.longitude - inicio.longitude) * deltaLongitude +
+            (barcoVisual.latitude - inicio.latitude) * deltaLatitude) /
+            denominador,
+          0,
+          1,
+        )
+      : 0;
+
+  const coordenada = {
+    latitude: inicio.latitude + deltaLatitude * progresso,
+    longitude: inicio.longitude + deltaLongitude * progresso,
+  };
+
+  return {
+    coordenada,
+    progresso,
+    distanciaKm: calcularDistanciaKm(
+      barcoVisual.latitude,
+      barcoVisual.longitude,
+      coordenada.latitude,
+      coordenada.longitude,
+    ),
+  };
+};
+
+const limitarLinhaAteBarcoVisual = (
+  segmentos: CoordenadaRastro[][],
+  barcoVisual: CoordenadaRastro | null,
+): CoordenadaRastro[][] => {
+  if (segmentos.length === 0) {
+    return [];
+  }
+
+  // Enquanto o marcador visual ainda está sendo inicializado, mantém o
+  // histórico disponível. Assim a linha não desaparece durante a seleção.
+  if (!barcoVisual) {
+    return segmentos;
+  }
+
+  let melhor: ProjecaoVisualNoRastro | null = null;
+
+  for (
+    let segmentoIndice = 0;
+    segmentoIndice < segmentos.length;
+    segmentoIndice += 1
+  ) {
+    const segmento = segmentos[segmentoIndice];
+
+    for (
+      let pontoIndice = 0;
+      pontoIndice < segmento.length - 1;
+      pontoIndice += 1
+    ) {
+      const projecao = projetarBarcoVisualNoSegmento(
+        barcoVisual,
+        segmento[pontoIndice],
+        segmento[pontoIndice + 1],
+      );
+
+      if (melhor === null || projecao.distanciaKm < melhor.distanciaKm) {
+        melhor = {
+          segmentoIndice,
+          pontoIndice,
+          coordenada: projecao.coordenada,
+          distanciaKm: projecao.distanciaKm,
+          progresso: projecao.progresso,
+        };
+      }
+    }
+  }
+
+  if (melhor === null || melhor.distanciaKm > 5) {
+    // O rastro selecionado já passou pelos filtros de viagem atual. Se a
+    // posição visual ainda estiver distante por causa da troca de barco ou de
+    // uma atualização de GPS, exibe o histórico sem criar uma ligação falsa.
+    return segmentos;
+  }
+
+  const resultado = segmentos
+    .slice(0, melhor.segmentoIndice)
+    .map((segmento) => [...segmento]);
+
+  const segmentoOriginal = segmentos[melhor.segmentoIndice];
+  const segmentoAtual = segmentoOriginal.slice(0, melhor.pontoIndice + 1);
+
+  const ultimoParDoSegmento =
+    melhor.pontoIndice === segmentoOriginal.length - 2;
+  const barcoPassouDoUltimoPontoVisivel =
+    ultimoParDoSegmento && melhor.progresso >= 0.995 && melhor.distanciaKm <= 2;
+
+  const pontoFinal = barcoPassouDoUltimoPontoVisivel
+    ? {
+        latitude: barcoVisual.latitude,
+        longitude: barcoVisual.longitude,
+      }
+    : melhor.coordenada;
+
+  const ultimo = segmentoAtual[segmentoAtual.length - 1];
+  const distanciaFinalMetros = ultimo
+    ? calcularDistanciaKm(
+        ultimo.latitude,
+        ultimo.longitude,
+        pontoFinal.latitude,
+        pontoFinal.longitude,
+      ) * 1000
+    : Number.POSITIVE_INFINITY;
+
+  if (distanciaFinalMetros >= 0.5) {
+    segmentoAtual.push(pontoFinal);
+  }
+
+  if (segmentoAtual.length > 1) {
+    resultado.push(segmentoAtual);
+  }
+
+  return resultado.filter((segmento) => segmento.length > 1);
+};
+
+const URL_TRAJETO_COMPLETO =
+  "https://us-central1-sistema-navegacao.cloudfunctions.net/obterTrajetoInteligenteEmbarcacao";
+
+type CacheTrajetoCompleto = {
+  pontos: CoordenadaRastro[];
+  salvoEmMs: number;
+  versao: number;
+};
+
+const VERSAO_CACHE_TRAJETO = 3;
+const DURACAO_CACHE_LOCAL_MS = 24 * 60 * 60 * 1000;
+const TEMPO_MAXIMO_SPINNER_ROTA_MS = 12_000;
+
+const cacheTrajetoCompletoMemoria = new Map<string, CacheTrajetoCompleto>();
+
+const normalizarIdRastreamento = (valor: any) =>
+  String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const obterIdsPossiveisRastreamento = (barcoBase: any) => {
+  const originais = [
+    barcoBase?.id,
+    barcoBase?.barcoId,
+    barcoBase?.barco_id,
+    barcoBase?.barcoIdAdmin,
+    barcoBase?.rastreadorId,
+    barcoBase?.idRastreador,
+    barcoBase?.deviceId,
+    barcoBase?.device_id,
+    barcoBase?.rastreador?.barcoId,
+    barcoBase?.rastreador?.id,
+  ];
+
+  const ids = new Set<string>();
+
+  originais.forEach((valorBruto) => {
+    const original = String(valorBruto || "").trim();
+    if (!original || original.includes("/")) return;
+
+    const normalizado = normalizarIdRastreamento(original);
+    [
+      original,
+      original.toUpperCase(),
+      original.toLowerCase(),
+      normalizado,
+      normalizado.replace(/_/g, " "),
+      normalizado.replace(/_/g, "-"),
+      normalizado.replace(/_/g, ""),
+    ].forEach((valor) => {
+      const limpo = String(valor || "").trim();
+      if (limpo && !limpo.includes("/")) ids.add(limpo);
+    });
+  });
+
+  return Array.from(ids).slice(0, 30);
+};
+
+const buscarTrajetoCompletoNoServidor = async ({
+  barcoIds,
+  inicioViagemMs,
+  origemReferencia,
+  posicaoAtual,
+  signal,
+}: {
+  barcoIds: string[];
+  inicioViagemMs: number;
+  origemReferencia: CoordenadaRastro | null;
+  posicaoAtual: CoordenadaRastro | null;
+  signal?: AbortSignal;
+}) => {
+  const resposta = await fetch(URL_TRAJETO_COMPLETO, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      barcoId: barcoIds[0] || "",
+      barcoIds,
+      inicioViagemMs: inicioViagemMs || 0,
+      origemReferencia,
+      posicaoAtual,
+    }),
+    signal,
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`Servidor do trajeto respondeu ${resposta.status}.`);
+  }
+
+  const dados = await resposta.json();
+  const pontos = Array.isArray(dados?.pontos)
+    ? limparCoordenadasRota(dados.pontos)
+    : [];
+
+  return {
+    pontos,
+    barcoIdUsado: String(dados?.barcoIdUsado || ""),
+    cache: Boolean(dados?.cache),
+    estrategia: String(dados?.estrategia || ""),
+    aliasesTestados: Array.isArray(dados?.aliasesTestados)
+      ? dados.aliasesTestados.map(String)
+      : [],
+    parentsTestados: Array.isArray(dados?.parentsTestados)
+      ? dados.parentsTestados.map(String)
+      : [],
+  };
+};
+
+export default function MapaView({
+  barco,
+  porto,
+  frota,
+  terminais,
+  userLocation,
+  toggleExpand,
+  mapaExpandido,
+  abrirAjuda,
+}: any) {
+  const mapRef = useRef<MapView>(null);
+  const insets = useSafeAreaInsets();
+  const { width: larguraTela, height: alturaTela } = useWindowDimensions();
+  const telaCompacta = larguraTela < 380 || alturaTela < 720;
+  const telaTablet = larguraTela >= 700;
+  const topoSeguroMapa = Math.max(insets.top + 8, telaCompacta ? 18 : 28);
+  const ajustandoLimiteMapaRef = useRef(false);
+  const [barcoRealtime, setBarcoRealtime] = useState<any>(null);
+  const [infoViagem, setInfoViagem] = useState<{
+    km: string;
+    tempo: string;
+  } | null>(null);
+  const idFocadoRef = useRef<string | null>(null);
+  const [mapaPronto, setMapaPronto] = useState(false);
+  const [painelVisivel, setPainelVisivel] = useState(true);
+  const [zoomAtual, setZoomAtual] = useState(0.1);
+  const nivelVisualPortos = useMemo(
+    () => obterNivelVisualPortos(zoomAtual),
+    [zoomAtual],
+  );
+  const [fecharDica, setFecharDica] = useState(false);
+
+  const [tipoMapa, setTipoMapa] = useState<"standard" | "satellite" | "hybrid">(
+    "hybrid",
+  );
+  const [agora, setAgora] = useState(Date.now());
+
+  useEffect(() => {
+    let ativo = true;
+
+    const carregarTipoMapaSalvo = async () => {
+      try {
+        const salvo = await AsyncStorage.getItem("@cmb_tipo_mapa");
+
+        if (
+          ativo &&
+          (salvo === "standard" || salvo === "satellite" || salvo === "hybrid")
+        ) {
+          setTipoMapa(salvo);
+        }
+      } catch (error) {
+        console.warn("Não foi possível carregar o tipo do mapa:", error);
+      }
+    };
+
+    carregarTipoMapaSalvo();
+
+    return () => {
+      ativo = false;
+    };
+  }, []);
+
+  const barcoSelecionadoParaCamera = useMemo(() => {
+    const barcoIdSelecionado = String(barco?.id || "").trim();
+
+    if (!barcoIdSelecionado) return null;
+
+    if (String(barcoRealtime?.id || "").trim() === barcoIdSelecionado) {
+      return barcoRealtime;
+    }
+
+    const barcoNaFrota = Array.isArray(frota)
+      ? frota.find(
+          (item: any) => String(item?.id || "").trim() === barcoIdSelecionado,
+        )
+      : null;
+
+    return barcoNaFrota || barco || null;
+  }, [barco, barcoRealtime, frota]);
+
+  const barcoCameraRef = useRef<any>(null);
+  barcoCameraRef.current = barcoSelecionadoParaCamera;
+
+  const focarBarcoSelecionadoImediatamente = useCallback(() => {
+    if (!mapaPronto || !mapRef.current || !barco?.id) {
+      return false;
+    }
+
+    const barcoCamera = barcoCameraRef.current;
+    const latitude = Number(barcoCamera?.ultima_posicao?.latitude);
+    const longitude = Number(barcoCamera?.ultima_posicao?.longitude);
+
+    if (
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      latitude === 0 ||
+      longitude === 0
+    ) {
+      return false;
+    }
+
+    mapRef.current.animateToRegion(
+      limitarRegiaoOperacional({
+        latitude,
+        longitude,
+        latitudeDelta: 0.015,
+        longitudeDelta: 0.015,
+      }),
+      280,
+    );
+
+    idFocadoRef.current = `${barco.id}-${porto?.id || "sem-porto"}`;
+
+    return true;
+  }, [barco?.id, mapaPronto, porto?.id]);
+
+  // --- CLIMA REAL DA POSIÇÃO DA EMBARCAÇÃO ---
+  const [dadosClima, setDadosClima] = useState<{
+    temp: number;
+    descricao: string;
+    condicao: string;
+    icone: string;
+    atualizadoEm: number;
+  } | null>(null);
+  const [carregandoClima, setCarregandoClima] = useState(false);
+  const [erroClima, setErroClima] = useState<string | null>(null);
+  const ultimaConsultaClimaRef = useRef<{
+    barcoId: string;
+    latitude: number;
+    longitude: number;
+    consultadoEm: number;
+  } | null>(null);
+
+  const escalaPulsante = useSharedValue(1);
+  const [escalasDoFirebase, setEscalasDoFirebase] = useState<any[]>([]);
+  const [gradesPorSentido, setGradesPorSentido] = useState<{
+    ida: any[];
+    volta: any[];
+  }>({ ida: [], volta: [] });
+  const [gradesDocumentos, setGradesDocumentos] = useState<{
+    ida: any | null;
+    volta: any | null;
+  }>({ ida: null, volta: null });
+  const [programacoesViagem, setProgramacoesViagem] = useState<
+    ProgramacaoViagem[]
+  >([]);
+  const [sentidoEfetivo, setSentidoEfetivo] = useState<"ida" | "volta">("ida");
+  const [rotaAoVivo, setRotaAoVivo] = useState<CoordenadaRastro[]>([]);
+  const [coordenadaVisualBarco, setCoordenadaVisualBarco] =
+    useState<CoordenadaRastro | null>(null);
+  const [mostrarPercurso, setMostrarPercurso] = useState(false);
+  const [carregandoPercurso, setCarregandoPercurso] = useState(false);
+  const ultimaAtualizacaoRastroRef = useRef(0);
+  const abortPercursoRef = useRef<AbortController | null>(null);
+  const carregandoPercursoRef = useRef(false);
+  const [statusFeedbackRota, setStatusFeedbackRota] = useState<
+    "carregando" | "sucesso" | "erro" | null
+  >(null);
+  const carregamentoRotaAnteriorRef = useRef(false);
+  const inicioFeedbackRotaRef = useRef(0);
+  const timerFeedbackRotaRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const mostrarPercursoVisualRef = useRef(false);
+  const totalPontosRotaVisualRef = useRef(0);
+  const progressoFeedbackRota = useSharedValue(0);
+  const opacidadeFeedbackRota = useSharedValue(0);
+  const escalaFeedbackRota = useSharedValue(0.96);
+
+  useEffect(() => {
+    carregandoPercursoRef.current = carregandoPercurso;
+  }, [carregandoPercurso]);
+
+  useEffect(() => {
+    const barcoInicial = barcoCameraRef.current || barco;
+    const latitudeInicial = Number(barcoInicial?.ultima_posicao?.latitude);
+    const longitudeInicial = Number(barcoInicial?.ultima_posicao?.longitude);
+
+    setCoordenadaVisualBarco(
+      Number.isFinite(latitudeInicial) &&
+        Number.isFinite(longitudeInicial) &&
+        latitudeInicial !== 0 &&
+        longitudeInicial !== 0
+        ? {
+            latitude: latitudeInicial,
+            longitude: longitudeInicial,
+          }
+        : null,
+    );
+    // A coordenada é reiniciada somente na troca de embarcação. Depois disso,
+    // o BarcoMarkerSuave passa a informar a posição visual com delay.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [barco?.id]);
+
+  const atualizarCoordenadaVisualBarco = useCallback(
+    (coordenada: CoordenadaRastro) => {
+      setCoordenadaVisualBarco((anterior) => {
+        if (!anterior) return coordenada;
+
+        const deslocamentoMetros =
+          calcularDistanciaKm(
+            anterior.latitude,
+            anterior.longitude,
+            coordenada.latitude,
+            coordenada.longitude,
+          ) * 1000;
+
+        return deslocamentoMetros >= 0.5 ? coordenada : anterior;
+      });
+    },
+    [],
+  );
+
+  const cancelarCarregamentoPercurso = useCallback((ocultarPercurso = true) => {
+    abortPercursoRef.current?.abort();
+    abortPercursoRef.current = null;
+    carregandoPercursoRef.current = false;
+    setCarregandoPercurso(false);
+
+    if (ocultarPercurso) {
+      setMostrarPercurso(false);
+    }
+  }, []);
+
+  const interromperPercursoSeEstiverCarregando = useCallback(() => {
+    if (!carregandoPercursoRef.current) return;
+    cancelarCarregamentoPercurso(true);
+  }, [cancelarCarregamentoPercurso]);
+  const [rotaOficial, setRotaOficial] = useState<any | null>(null);
+  const [infoRotaOficial, setInfoRotaOficial] = useState<{
+    km: string;
+    tempo: string;
+    minutos: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const buscarGradesDosDoisSentidos = async () => {
+      const barcoIdAtivo = String(barco?.id || barcoRealtime?.id || "").trim();
+
+      if (!barcoIdAtivo) {
+        setGradesPorSentido({ ida: [], volta: [] });
+        setGradesDocumentos({ ida: null, volta: null });
+        setEscalasDoFirebase([]);
+        return;
+      }
+
+      try {
+        const [idaSnap, voltaSnap] = await Promise.all([
+          getDoc(doc(db, "grades_viagens", `${barcoIdAtivo}_ida`)),
+          getDoc(doc(db, "grades_viagens", `${barcoIdAtivo}_volta`)),
+        ]);
+
+        const extrairDocumento = (snapshot: any) => {
+          if (!snapshot.exists()) return null;
+          return { id: snapshot.id, ...snapshot.data() };
+        };
+
+        const idaDocumento = extrairDocumento(idaSnap);
+        const voltaDocumento = extrairDocumento(voltaSnap);
+
+        const extrairItinerario = (documento: any) => {
+          const lista = documento?.itinerario || documento?.escalas || [];
+          return Array.isArray(lista) ? lista : [];
+        };
+
+        setGradesDocumentos({
+          ida: idaDocumento,
+          volta: voltaDocumento,
+        });
+        setGradesPorSentido({
+          ida: extrairItinerario(idaDocumento),
+          volta: extrairItinerario(voltaDocumento),
+        });
+      } catch (error) {
+        console.error("❌ Erro ao carregar grades de ida e volta:", error);
+        setGradesPorSentido({ ida: [], volta: [] });
+        setGradesDocumentos({ ida: null, volta: null });
+        setEscalasDoFirebase([]);
+      }
+    };
+
+    void buscarGradesDosDoisSentidos();
+  }, [barco?.id, barcoRealtime?.id]);
+
+  useEffect(() => {
+    const barcoIdAtivo = String(barco?.id || barcoRealtime?.id || "").trim();
+
+    if (!barcoIdAtivo) {
+      setProgramacoesViagem([]);
+      return;
+    }
+
+    const consulta = firestoreQuery(
+      collection(db, "programacoes_viagem"),
+      where("barcoId", "==", barcoIdAtivo),
+    );
+
+    const unsubscribe = onSnapshot(
+      consulta,
+      (snapshot) => {
+        setProgramacoesViagem(
+          snapshot.docs
+            .map((documento) =>
+              normalizarProgramacaoViagem(documento.id, documento.data()),
+            )
+            .filter((programacao) => programacao.ativo),
+        );
+      },
+      (error) => {
+        console.log("Erro ao carregar programação de viagens:", error);
+        setProgramacoesViagem([]);
+      },
+    );
+
+    return () => unsubscribe();
+  }, [barco?.id, barcoRealtime?.id]);
+
+  const programacoesEfetivas = useMemo(() => {
+    if (programacoesViagem.length > 0) return programacoesViagem;
+
+    const barcoIdAtivo = String(barco?.id || barcoRealtime?.id || "").trim();
+    return montarProgramacoesLegadas(
+      [gradesDocumentos.ida, gradesDocumentos.volta],
+      barcoIdAtivo,
+    );
+  }, [
+    barco?.id,
+    barcoRealtime?.id,
+    gradesDocumentos.ida,
+    gradesDocumentos.volta,
+    programacoesViagem,
+  ]);
+
+  const estadoOperacional = useMemo(
+    () =>
+      calcularEstadoOperacionalViagem({
+        programacoes: programacoesEfetivas,
+        barco: barcoRealtime || barco,
+        agoraMs: agora,
+      }),
+    [agora, barco, barcoRealtime, programacoesEfetivas],
+  );
+
+  const itinerarioProgramadoAtual = useMemo(() => {
+    const programacao = estadoOperacional.ocorrenciaAtual?.programacao;
+    const itinerario = Array.isArray(programacao?.itinerario)
+      ? programacao.itinerario
+      : Array.isArray(programacao?.escalas)
+        ? programacao.escalas
+        : [];
+
+    return itinerario.filter((ponto: any) => ponto?.ativo !== false);
+  }, [estadoOperacional.ocorrenciaAtual?.programacao]);
+
+  useEffect(() => {
+    const barcoAtual = barcoRealtime || barco;
+    const sentidoProgramado =
+      estadoOperacional.ocorrenciaAtual?.programacao.sentido;
+    const sentido =
+      sentidoProgramado === "ida" || sentidoProgramado === "volta"
+        ? sentidoProgramado
+        : inferirSentidoDaViagem({
+            sentidoInformado: barcoAtual?.sentido,
+            barco: barcoAtual,
+            gradeIda: gradesPorSentido.ida,
+            gradeVolta: gradesPorSentido.volta,
+            terminais: terminais || [],
+            historicoRecente: rotaAoVivo,
+          });
+
+    setSentidoEfetivo(sentido);
+
+    const gradeEscolhida =
+      sentido === "volta" ? gradesPorSentido.volta : gradesPorSentido.ida;
+    const gradeAlternativa =
+      sentido === "volta" ? gradesPorSentido.ida : gradesPorSentido.volta;
+
+    setEscalasDoFirebase(
+      itinerarioProgramadoAtual.length > 0
+        ? itinerarioProgramadoAtual
+        : gradeEscolhida.length > 0
+          ? gradeEscolhida
+          : gradeAlternativa,
+    );
+  }, [
+    barco,
+    barcoRealtime,
+    estadoOperacional.ocorrenciaAtual?.programacao.sentido,
+    gradesPorSentido.ida,
+    gradesPorSentido.volta,
+    itinerarioProgramadoAtual,
+    rotaAoVivo,
+    terminais,
+  ]);
+
+  useEffect(() => {
+    if (barco?.id) {
+      escalaPulsante.value = withRepeat(
+        withSequence(
+          withTiming(1.1, { duration: 600 }),
+          withTiming(1, { duration: 600 }),
+        ),
+        -1,
+        true,
+      );
+    } else {
+      escalaPulsante.value = withTiming(1);
+    }
+  }, [barco?.id]);
+
+  const estiloAnimadoIcone = useAnimatedStyle(() => ({
+    transform: [{ scale: escalaPulsante.value }],
+  }));
+
+  useEffect(() => {
+    mostrarPercursoVisualRef.current = mostrarPercurso;
+    totalPontosRotaVisualRef.current = rotaAoVivo.length;
+  }, [mostrarPercurso, rotaAoVivo.length]);
+
+  useEffect(() => {
+    const estavaCarregando = carregamentoRotaAnteriorRef.current;
+    carregamentoRotaAnteriorRef.current = carregandoPercurso;
+
+    if (timerFeedbackRotaRef.current) {
+      clearTimeout(timerFeedbackRotaRef.current);
+      timerFeedbackRotaRef.current = null;
+    }
+
+    if (carregandoPercurso) {
+      inicioFeedbackRotaRef.current = Date.now();
+      setStatusFeedbackRota("carregando");
+      opacidadeFeedbackRota.value = withTiming(1, { duration: 180 });
+      escalaFeedbackRota.value = withTiming(1, { duration: 180 });
+      progressoFeedbackRota.value = 0;
+      progressoFeedbackRota.value = withRepeat(
+        withTiming(1, { duration: 1450 }),
+        -1,
+        false,
+      );
+      return;
+    }
+
+    if (!estavaCarregando) return;
+
+    const tempoExibido = Date.now() - inicioFeedbackRotaRef.current;
+    const esperaMinima = Math.max(0, 650 - tempoExibido);
+
+    timerFeedbackRotaRef.current = setTimeout(() => {
+      const percursoAindaAberto = mostrarPercursoVisualRef.current;
+
+      if (!percursoAindaAberto) {
+        opacidadeFeedbackRota.value = withTiming(0, { duration: 160 });
+        escalaFeedbackRota.value = withTiming(0.97, { duration: 160 });
+        setStatusFeedbackRota(null);
+        return;
+      }
+
+      const trajetoDisponivel = totalPontosRotaVisualRef.current > 1;
+      setStatusFeedbackRota(trajetoDisponivel ? "sucesso" : "erro");
+      progressoFeedbackRota.value = withTiming(1, { duration: 180 });
+      opacidadeFeedbackRota.value = withTiming(1, { duration: 120 });
+      escalaFeedbackRota.value = withSequence(
+        withTiming(1.035, { duration: 110 }),
+        withTiming(1, { duration: 150 }),
+      );
+
+      const tempoMensagem = trajetoDisponivel ? 900 : 1900;
+
+      timerFeedbackRotaRef.current = setTimeout(() => {
+        opacidadeFeedbackRota.value = withTiming(0, { duration: 220 });
+        escalaFeedbackRota.value = withTiming(0.98, { duration: 220 });
+
+        timerFeedbackRotaRef.current = setTimeout(() => {
+          setStatusFeedbackRota(null);
+          timerFeedbackRotaRef.current = null;
+        }, 230);
+      }, tempoMensagem);
+    }, esperaMinima);
+  }, [carregandoPercurso]);
+
+  useEffect(() => {
+    return () => {
+      if (timerFeedbackRotaRef.current) {
+        clearTimeout(timerFeedbackRotaRef.current);
+      }
+    };
+  }, []);
+
+  const estiloFeedbackRota = useAnimatedStyle(() => ({
+    opacity: opacidadeFeedbackRota.value,
+    transform: [{ scale: escalaFeedbackRota.value }],
+  }));
+
+  const estiloBarcoFeedbackRota = useAnimatedStyle(() => ({
+    transform: [{ translateX: progressoFeedbackRota.value * 126 }],
+  }));
+
+  const estiloBrilhoFeedbackRota = useAnimatedStyle(() => ({
+    transform: [{ translateX: progressoFeedbackRota.value * 188 - 54 }],
+  }));
+
+  useEffect(() => {
+    const timer = setInterval(() => setAgora(Date.now()), 3000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Mantém posição, sentido e velocidade da embarcação selecionada em tempo real.
+  useEffect(() => {
+    if (!barco?.id) {
+      setBarcoRealtime(null);
+      return;
+    }
+
+    const barcoIdSelecionado = String(barco.id);
+
+    setBarcoRealtime((atual: any) =>
+      String(atual?.id || "") === barcoIdSelecionado ? atual : null,
+    );
+
+    const unsubscribe = onSnapshot(
+      doc(db, "embarcacoes", String(barco.id)),
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setBarcoRealtime(null);
+          return;
+        }
+
+        setBarcoRealtime({
+          id: snapshot.id,
+          ...snapshot.data(),
+        });
+      },
+      (error) => {
+        console.log("Erro ao atualizar embarcação em tempo real:", error);
+        setBarcoRealtime(null);
+      },
+    );
+
+    return () => unsubscribe();
+  }, [barco?.id]);
+
+  // --- TRAJETO LEVE, LIMPO E COM CACHE PERSISTENTE ---
+  // Mostra primeiro o último percurso salvo no aparelho. A atualização do
+  // servidor ocorre em segundo plano e não reinicia a cada pacote de GPS.
+  useEffect(() => {
+    let cancelado = false;
+    let timerAtualizacao: ReturnType<typeof setInterval> | null = null;
+
+    const carregarPercurso = async (silencioso = false) => {
+      if (!barco?.id || !mostrarPercurso) {
+        setRotaAoVivo([]);
+        setCarregandoPercurso(false);
+        return;
+      }
+
+      const barcoBaseIds = {
+        ...barco,
+        id: barco?.id,
+      };
+      const idsPossiveis = obterIdsPossiveisRastreamento(barcoBaseIds);
+
+      if (idsPossiveis.length === 0) {
+        setRotaAoVivo([]);
+        setCarregandoPercurso(false);
+        return;
+      }
+
+      const inicioViagemMs = estadoOperacional.inicioRastroMs || 0;
+      const rotaOficialAtual = limparCoordenadasRota(rotaOficial?.pontos || []);
+      const origemReferencia = rotaOficialAtual[0] || null;
+      const latitudeAtual = Number(
+        barcoRealtime?.ultima_posicao?.latitude ??
+          barco?.ultima_posicao?.latitude,
+      );
+      const longitudeAtual = Number(
+        barcoRealtime?.ultima_posicao?.longitude ??
+          barco?.ultima_posicao?.longitude,
+      );
+      const posicaoAtual =
+        Number.isFinite(latitudeAtual) &&
+        Number.isFinite(longitudeAtual) &&
+        latitudeAtual !== 0 &&
+        longitudeAtual !== 0
+          ? {
+              latitude: latitudeAtual,
+              longitude: longitudeAtual,
+            }
+          : null;
+      const idCache = normalizarIdRastreamento(idsPossiveis[0] || barco.id);
+      const chaveCache = `@cmb/trajeto:v${VERSAO_CACHE_TRAJETO}:${idCache}:${inicioViagemMs}`;
+
+      let exibiuCache = false;
+
+      const exibirPontos = (
+        pontosRecebidos: CoordenadaRastro[],
+        salvoEmMs = Date.now(),
+      ) => {
+        const segmentos = escolherSegmentosDaViagemAtual({
+          pontos: pontosRecebidos,
+          inicioViagemMs,
+          posicaoAtual,
+        });
+        const pontosLimpos = segmentos.flat();
+
+        if (pontosLimpos.length <= 1) return false;
+
+        cacheTrajetoCompletoMemoria.set(chaveCache, {
+          pontos: pontosLimpos,
+          salvoEmMs,
+          versao: VERSAO_CACHE_TRAJETO,
+        });
+        setRotaAoVivo(pontosLimpos);
+        exibiuCache = true;
+        return true;
+      };
+
+      const cacheMemoria = cacheTrajetoCompletoMemoria.get(chaveCache);
+
+      if (
+        cacheMemoria?.versao === VERSAO_CACHE_TRAJETO &&
+        Date.now() - cacheMemoria.salvoEmMs < DURACAO_CACHE_LOCAL_MS
+      ) {
+        exibirPontos(cacheMemoria.pontos, cacheMemoria.salvoEmMs);
+      }
+
+      if (!exibiuCache) {
+        try {
+          const cachePersistente = await AsyncStorage.getItem(chaveCache);
+
+          if (cachePersistente && !cancelado) {
+            const cache = JSON.parse(cachePersistente) as CacheTrajetoCompleto;
+
+            if (
+              cache?.versao === VERSAO_CACHE_TRAJETO &&
+              Array.isArray(cache.pontos) &&
+              Date.now() - Number(cache.salvoEmMs || 0) < DURACAO_CACHE_LOCAL_MS
+            ) {
+              exibirPontos(
+                limparCoordenadasRota(cache.pontos),
+                Number(cache.salvoEmMs || Date.now()),
+              );
+            }
+          }
+        } catch (error) {
+          console.log("Cache local do trajeto indisponível:", error);
+        }
+      }
+
+      if (!silencioso) {
+        if (exibiuCache) {
+          carregandoPercursoRef.current = false;
+          setCarregandoPercurso(false);
+        } else {
+          carregandoPercursoRef.current = true;
+          setCarregandoPercurso(true);
+        }
+      }
+
+      abortPercursoRef.current?.abort();
+      const controller = new AbortController();
+      abortPercursoRef.current = controller;
+
+      const timerSpinner = setTimeout(() => {
+        if (!cancelado && abortPercursoRef.current === controller) {
+          controller.abort();
+          abortPercursoRef.current = null;
+          carregandoPercursoRef.current = false;
+          setCarregandoPercurso(false);
+        }
+      }, TEMPO_MAXIMO_SPINNER_ROTA_MS);
+
+      try {
+        const resultado = await buscarTrajetoCompletoNoServidor({
+          barcoIds: idsPossiveis,
+          inicioViagemMs,
+          origemReferencia,
+          posicaoAtual,
+          signal: controller.signal,
+        });
+
+        if (cancelado) return;
+
+        const pontosServidor = limparCoordenadasRota(resultado.pontos);
+        const segmentos = escolherSegmentosDaViagemAtual({
+          pontos: pontosServidor,
+          inicioViagemMs,
+          posicaoAtual,
+        });
+        const pontosLimpos = segmentos.flat();
+
+        if (pontosLimpos.length > 1) {
+          const novoCache: CacheTrajetoCompleto = {
+            pontos: pontosLimpos,
+            salvoEmMs: Date.now(),
+            versao: VERSAO_CACHE_TRAJETO,
+          };
+
+          cacheTrajetoCompletoMemoria.set(chaveCache, novoCache);
+          setRotaAoVivo(pontosLimpos);
+
+          void AsyncStorage.setItem(
+            chaveCache,
+            JSON.stringify(novoCache),
+          ).catch((error) => {
+            console.log("Não foi possível persistir o trajeto:", error);
+          });
+
+          console.log("Trajeto inteligente carregado:", {
+            barcoIdUsado: resultado.barcoIdUsado,
+            estrategia: resultado.estrategia,
+            pontos: pontosLimpos.length,
+            cache: resultado.cache,
+          });
+          return;
+        }
+
+        throw new Error("Servidor não retornou um trecho válido.");
+      } catch (error) {
+        if (cancelado || controller?.signal.aborted) {
+          return;
+        }
+
+        if (exibiuCache) {
+          console.log(
+            "Atualização do trajeto falhou; mantendo cache local:",
+            error,
+          );
+          return;
+        }
+
+        console.log(
+          "Servidor do trajeto indisponível; usando consulta curta:",
+          error,
+        );
+
+        try {
+          let pontosFallback: CoordenadaRastro[] = [];
+
+          for (const idPossivel of idsPossiveis.slice(0, 8)) {
+            if (pontosFallback.length > 1) break;
+
+            const pontosRef = collection(
+              db,
+              "rastreamento",
+              idPossivel,
+              "pontos",
+            );
+            const consultas = [
+              firestoreQuery(
+                pontosRef,
+                orderBy("criado_em", "desc"),
+                limit(600),
+              ),
+              firestoreQuery(
+                pontosRef,
+                orderBy("criadoEm", "desc"),
+                limit(600),
+              ),
+              firestoreQuery(
+                pontosRef,
+                orderBy("timestamp", "desc"),
+                limit(600),
+              ),
+              firestoreQuery(
+                pontosRef,
+                orderBy(documentId(), "desc"),
+                limit(600),
+              ),
+            ];
+
+            for (const consulta of consultas) {
+              try {
+                const snapshot = await getDocs(consulta);
+                if (cancelado) return;
+
+                const encontrados = snapshot.docs
+                  .map((docSnap, indice) => {
+                    const dados = docSnap.data();
+                    return {
+                      latitude: Number(
+                        dados.latitude ??
+                          dados.lat ??
+                          dados.posicao?.latitude ??
+                          dados.coordenadas?.latitude,
+                      ),
+                      longitude: Number(
+                        dados.longitude ??
+                          dados.lng ??
+                          dados.lon ??
+                          dados.posicao?.longitude ??
+                          dados.coordenadas?.longitude,
+                      ),
+                      criadoEmMs:
+                        converterDataRastroMs(
+                          dados.criado_em ??
+                            dados.criadoEm ??
+                            dados.timestamp ??
+                            dados.data ??
+                            dados.salvoEm,
+                        ) || indice,
+                    };
+                  })
+                  .filter(
+                    (ponto) =>
+                      Number.isFinite(ponto.latitude) &&
+                      Number.isFinite(ponto.longitude) &&
+                      ponto.latitude !== 0 &&
+                      ponto.longitude !== 0,
+                  )
+                  .sort(
+                    (a, b) =>
+                      Number(a.criadoEmMs || 0) - Number(b.criadoEmMs || 0),
+                  );
+
+                if (encontrados.length > 1) {
+                  pontosFallback = encontrados;
+                  break;
+                }
+              } catch {
+                // Tenta o próximo formato de data.
+              }
+            }
+          }
+
+          const segmentos = escolherSegmentosDaViagemAtual({
+            pontos: pontosFallback,
+            inicioViagemMs,
+            posicaoAtual,
+          });
+          setRotaAoVivo(segmentos.flat());
+        } catch (fallbackError) {
+          console.log("Erro no fallback curto do trajeto:", fallbackError);
+          if (!cancelado) setRotaAoVivo([]);
+        }
+      } finally {
+        clearTimeout(timerSpinner);
+
+        if (!cancelado && abortPercursoRef.current === controller) {
+          abortPercursoRef.current = null;
+          carregandoPercursoRef.current = false;
+          setCarregandoPercurso(false);
+        }
+      }
+    };
+
+    void carregarPercurso(false);
+
+    timerAtualizacao = setInterval(() => {
+      void carregarPercurso(true);
+    }, 60_000);
+
+    return () => {
+      cancelado = true;
+      abortPercursoRef.current?.abort();
+      abortPercursoRef.current = null;
+
+      if (timerAtualizacao) {
+        clearInterval(timerAtualizacao);
+      }
+    };
+  }, [
+    barco?.id,
+    barco?.barcoId,
+    barco?.barco_id,
+    barco?.barcoIdAdmin,
+    estadoOperacional.inicioRastroMs,
+    mostrarPercurso,
+    rotaOficial?.id,
+  ]);
+
+  // --- ROTA OFICIAL DEFINIDA NO SISTEMA DE NAVEGAÇÃO ---
+  useEffect(() => {
+    if (!barco?.id) {
+      setRotaOficial(null);
+      return;
+    }
+
+    const unsubscribe = onSnapshot(
+      collection(db, "rotas_oficiais"),
+      (snapshot) => {
+        const barcoIdAtual = String(barco.id);
+        const sentidoAtual = String(sentidoEfetivo).toLowerCase();
+
+        const nomesDestinoSelecionado = [
+          porto?.nome,
+          porto?.porto,
+          porto?.cidade,
+          porto?.local,
+          porto?.id,
+        ].filter(Boolean);
+
+        const candidatas = snapshot.docs
+          .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }))
+          .filter((rota: any) => {
+            if (rota.ativa === false) return false;
+            if (String(rota.barcoId || "") !== barcoIdAtual) return false;
+
+            const sentidoRota = String(rota.sentido || "ida").toLowerCase();
+
+            if (sentidoRota && sentidoAtual && sentidoRota !== sentidoAtual) {
+              return false;
+            }
+
+            if (nomesDestinoSelecionado.length === 0) return true;
+
+            return nomesDestinoSelecionado.some((nomeDestino) =>
+              textosCombinamRotaOficial(rota.destino, nomeDestino),
+            );
+          })
+          .sort((a: any, b: any) => {
+            const pontosA = Array.isArray(a.pontos) ? a.pontos.length : 0;
+            const pontosB = Array.isArray(b.pontos) ? b.pontos.length : 0;
+            return pontosB - pontosA;
+          });
+
+        setRotaOficial(candidatas[0] || null);
+      },
+      (error) => {
+        console.log("Erro ao carregar rota oficial:", error);
+        setRotaOficial(null);
+      },
+    );
+
+    return () => unsubscribe();
+  }, [barco?.id, sentidoEfetivo, porto?.id, porto?.nome]);
+
+  // --- CLIMA REAL DA POSIÇÃO ATUAL DA EMBARCAÇÃO ---
+  const buscarClimaLocal = useCallback(
+    async (lat: number, lon: number, forcar = false) => {
+      const API_KEY =
+        process.env.EXPO_PUBLIC_OPENWEATHER_API_KEY ||
+        "1cc0093ff36352a8c5145551411fc9cf";
+      const barcoId = String(barco?.id || barcoRealtime?.id || "sem-barco");
+
+      if (!API_KEY) {
+        setDadosClima(null);
+        setErroClima("Chave da meteorologia não configurada");
+        return;
+      }
+
+      const cache = ultimaConsultaClimaRef.current;
+      const agoraConsulta = Date.now();
+      const deslocamentoDesdeConsulta = cache
+        ? calcularDistanciaKm(cache.latitude, cache.longitude, lat, lon)
+        : Infinity;
+
+      if (
+        !forcar &&
+        cache?.barcoId === barcoId &&
+        agoraConsulta - cache.consultadoEm < 10 * 60 * 1000 &&
+        deslocamentoDesdeConsulta < 5
+      ) {
+        return;
+      }
+
+      try {
+        setCarregandoClima(true);
+        setErroClima(null);
+
+        const resp = await fetch(
+          `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${API_KEY}&units=metric&lang=pt_br`,
+        );
+
+        if (!resp.ok) {
+          throw new Error(`Meteorologia respondeu HTTP ${resp.status}`);
+        }
+
+        const data = await resp.json();
+        const climaPrincipal = Array.isArray(data?.weather)
+          ? data.weather[0]
+          : null;
+        const temperatura = Number(data?.main?.temp);
+
+        if (!Number.isFinite(temperatura) || !climaPrincipal) {
+          throw new Error("Resposta meteorológica inválida");
+        }
+
+        setDadosClima({
+          temp: Math.round(temperatura),
+          descricao: String(climaPrincipal.description || "").trim(),
+          condicao: String(climaPrincipal.main || ""),
+          icone: String(climaPrincipal.icon || ""),
+          atualizadoEm: agoraConsulta,
+        });
+
+        ultimaConsultaClimaRef.current = {
+          barcoId,
+          latitude: lat,
+          longitude: lon,
+          consultadoEm: agoraConsulta,
+        };
+      } catch (error) {
+        console.log("Erro clima:", error);
+        setDadosClima(null);
+        setErroClima("Clima indisponível");
+      } finally {
+        setCarregandoClima(false);
+      }
+    },
+    [barco?.id, barcoRealtime?.id],
+  );
+
+  useEffect(() => {
+    const lat = Number(
+      barcoRealtime?.ultima_posicao?.latitude ??
+        barco?.ultima_posicao?.latitude,
+    );
+    const lon = Number(
+      barcoRealtime?.ultima_posicao?.longitude ??
+        barco?.ultima_posicao?.longitude,
+    );
+
+    if (
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lon) ||
+      lat === 0 ||
+      lon === 0
+    ) {
+      setDadosClima(null);
+      setErroClima("Aguardando posição para consultar o clima");
+      return;
+    }
+
+    void buscarClimaLocal(lat, lon);
+
+    const timer = setInterval(
+      () => {
+        void buscarClimaLocal(lat, lon, true);
+      },
+      10 * 60 * 1000,
+    );
+
+    return () => clearInterval(timer);
+  }, [
+    barco?.id,
+    barco?.ultima_posicao?.latitude,
+    barco?.ultima_posicao?.longitude,
+    barcoRealtime?.ultima_posicao?.latitude,
+    barcoRealtime?.ultima_posicao?.longitude,
+    buscarClimaLocal,
+  ]);
+
+  const verificarStatusSinal = (vistoPorUltimo: string) => {
+    if (!vistoPorUltimo) return "offline";
+    const dataConexao = new Date(vistoPorUltimo).getTime();
+    const diferencaSegundos = (agora - dataConexao) / 1000;
+    return diferencaSegundos < 90 ? "online" : "sem_sinal";
+  };
+
+  useEffect(() => {
+    if (!barco?.id || !mapaPronto) return;
+
+    idFocadoRef.current = null;
+
+    const frame = requestAnimationFrame(() => {
+      focarBarcoSelecionadoImediatamente();
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [barco?.id, focarBarcoSelecionadoImediatamente, mapaPronto]);
+
+  useEffect(() => {
+    const lat =
+      barcoRealtime?.ultima_posicao?.latitude ??
+      barco?.ultima_posicao?.latitude;
+    const lng =
+      barcoRealtime?.ultima_posicao?.longitude ??
+      barco?.ultima_posicao?.longitude;
+    const portLat = porto?.coordenadas?.lat ?? porto?.coordenadas?.latitude;
+    const portLng = porto?.coordenadas?.lng ?? porto?.coordenadas?.longitude;
+
+    const bLat = Number(lat);
+    const bLng = Number(lng);
+    const pLat = Number(portLat);
+    const pLng = Number(portLng);
+
+    const previsao = calcularPrevisaoAteCoordenada(
+      barcoRealtime || barco,
+      pLat,
+      pLng,
+    );
+
+    if (previsao) {
+      setInfoViagem({
+        km: previsao.km,
+        tempo: previsao.tempo,
+      });
+    } else {
+      setInfoViagem(null);
+    }
+  }, [barcoRealtime?.ultima_posicao, porto, barco?.id]);
+
+  useEffect(() => {
+    const pontosRotaOficial = limparCoordenadasRota(rotaOficial?.pontos || []);
+    const barcoFoco = barcoRealtime || barco;
+
+    if (!barcoFoco || pontosRotaOficial.length < 2) {
+      setInfoRotaOficial(null);
+      return;
+    }
+
+    const previsao = calcularDistanciaRestantePelaRota(
+      barcoFoco,
+      pontosRotaOficial,
+    );
+
+    if (!previsao) {
+      setInfoRotaOficial(null);
+      return;
+    }
+
+    setInfoRotaOficial({
+      km: previsao.km,
+      tempo: previsao.tempo,
+      minutos: previsao.minutos,
+    });
+  }, [
+    rotaOficial?.id,
+    rotaOficial?.pontos,
+    barcoRealtime?.ultima_posicao,
+    barco?.ultima_posicao,
+  ]);
+
+  const centralizarMapa = () => {
+    const barcoCamera = barcoCameraRef.current;
+    const lat = barcoCamera?.ultima_posicao?.latitude;
+    const lng = barcoCamera?.ultima_posicao?.longitude;
+    const portLat = porto?.coordenadas?.lat ?? porto?.coordenadas?.latitude;
+    const portLng = porto?.coordenadas?.lng ?? porto?.coordenadas?.longitude;
+
+    const bLat = Number(lat);
+    const bLng = Number(lng);
+    const pLat = Number(portLat);
+    const pLng = Number(portLng);
+
+    const temBarco = !isNaN(bLat) && !isNaN(bLng);
+    const temPorto = !isNaN(pLat) && !isNaN(pLng);
+
+    if (rotaAoVivo.length > 1) {
+      const coordenadasParaExibir = [...rotaAoVivo];
+
+      if (temBarco) {
+        coordenadasParaExibir.push({
+          latitude: bLat,
+          longitude: bLng,
+        });
+      }
+
+      if (temPorto) {
+        coordenadasParaExibir.push({
+          latitude: pLat,
+          longitude: pLng,
+        });
+      }
+
+      mapRef.current?.fitToCoordinates(coordenadasParaExibir, {
+        edgePadding: {
+          top: 100,
+          right: 70,
+          bottom: 140,
+          left: 70,
+        },
+        animated: true,
+      });
+
+      return;
+    }
+
+    if (temBarco && temPorto) {
+      mapRef.current?.fitToCoordinates(
+        [
+          { latitude: bLat, longitude: bLng },
+          { latitude: pLat, longitude: pLng },
+        ],
+        {
+          edgePadding: { top: 80, right: 80, bottom: 120, left: 30 },
+          animated: true,
+        },
+      );
+    } else if (temBarco) {
+      mapRef.current?.animateToRegion(
+        limitarRegiaoOperacional({
+          latitude: bLat,
+          longitude: bLng,
+          latitudeDelta: 0.015,
+          longitudeDelta: 0.015,
+        }),
+        1000,
+      );
+    } else if (temPorto) {
+      mapRef.current?.animateToRegion(
+        limitarRegiaoOperacional({
+          latitude: pLat,
+          longitude: pLng,
+          latitudeDelta: 0.015,
+          longitudeDelta: 0.015,
+        }),
+        1000,
+      );
+    }
+  };
+
+  useEffect(() => {
+    if (userLocation && !barco?.id && !porto?.id) {
+      mapRef.current?.animateToRegion(
+        limitarRegiaoOperacional({
+          latitude: userLocation.lat,
+          longitude: userLocation.lng,
+          latitudeDelta: 0.015,
+          longitudeDelta: 0.015,
+        }),
+        1200,
+      );
+    }
+  }, [userLocation]);
+
+  useEffect(() => {
+    // 🟢 CORREÇÃO: Fallback de segurança inserido para bLat e bLng não zerarem a infoViagem em tempo de execução
+    const latFoco =
+      barcoRealtime?.ultima_posicao?.latitude ??
+      barco?.ultima_posicao?.latitude;
+    const lngFoco =
+      barcoRealtime?.ultima_posicao?.longitude ??
+      barco?.ultima_posicao?.longitude;
+
+    const bLat = Number(latFoco);
+    const bLng = Number(lngFoco);
+    const pLat = Number(
+      porto?.coordenadas?.lat ?? porto?.coordenadas?.latitude,
+    );
+    const pLng = Number(
+      porto?.coordenadas?.lng ?? porto?.coordenadas?.longitude,
+    );
+
+    const barcoValido = !isNaN(bLat) && !isNaN(bLng);
+    const portoValido = !isNaN(pLat) && !isNaN(pLng);
+
+    if (barcoValido && portoValido) {
+      const previsao = calcularPrevisaoAteCoordenada(
+        barcoRealtime || barco,
+        pLat,
+        pLng,
+      );
+
+      setInfoViagem(
+        previsao
+          ? {
+              km: previsao.km,
+              tempo: previsao.tempo,
+            }
+          : null,
+      );
+    } else {
+      setInfoViagem(null);
+    }
+
+    if (barcoValido || portoValido) {
+      const currentSelectionId = `${barco?.id || "sem-barco"}-${porto?.id || "sem-porto"}`;
+
+      if (idFocadoRef.current !== currentSelectionId) {
+        const focouBarco = barco?.id
+          ? focarBarcoSelecionadoImediatamente()
+          : false;
+
+        if (!focouBarco && portoValido) {
+          centralizarMapa();
+          idFocadoRef.current = currentSelectionId;
+        }
+      }
+    }
+  }, [
+    barco?.id,
+    barcoRealtime?.id,
+    barcoRealtime?.ultima_posicao,
+    focarBarcoSelecionadoImediatamente,
+    porto,
+  ]);
+
+  // --- MOTOR DE PROGRESSO DA ROTA: RESPEITA A ORDEM DAS ESCALAS ---
+  let proximaEscalaNome = "";
+  let infoProximaEscala: any = null;
+
+  const barcoFocoGps = barcoRealtime || barco;
+  const progressoRotaAtual = determinarProgressoRota({
+    barco: barcoFocoGps,
+    escalas: escalasDoFirebase,
+    terminais: terminais || [],
+    rotaOficialPontos: limparCoordenadasRota(rotaOficial?.pontos || []),
+    historicoRecente: rotaAoVivo,
+  });
+
+  if (progressoRotaAtual?.proximaEscala) {
+    const proximaEscala = progressoRotaAtual.proximaEscala;
+    proximaEscalaNome = proximaEscala.nome;
+
+    if (proximaEscala.coordenada) {
+      const previsao = calcularPrevisaoAteCoordenada(
+        barcoFocoGps,
+        proximaEscala.coordenada.latitude,
+        proximaEscala.coordenada.longitude,
+      );
+
+      infoProximaEscala = previsao
+        ? {
+            km: previsao.km,
+            tempo: previsao.tempo,
+          }
+        : null;
+    }
+  }
+
+  const barcoSelecionadoAtual =
+    barcoRealtime || frota?.find((b: any) => b.id === barco?.id) || barco;
+
+  const portoAtendidoPeloBarco = barcoAtendePortoSelecionado(
+    barcoSelecionadoAtual,
+    porto,
+  );
+
+  const rotaNaoAtendida =
+    !!barco?.id && !!porto?.id && portoAtendidoPeloBarco === false;
+
+  const rotaOficialPontos = limparCoordenadasRota(rotaOficial?.pontos || []);
+  const viagemConcluidaPelaRota =
+    estadoOperacional.viagemAtiva && progressoRotaAtual?.rotaConcluida === true;
+  const permiteEtaAgora =
+    estadoOperacional.permiteEta && !viagemConcluidaPelaRota;
+
+  const exibirPrevisao =
+    permiteEtaAgora && portoAtendidoPeloBarco
+      ? porto?.id
+        ? infoRotaOficial || infoViagem
+        : infoProximaEscala || infoRotaOficial
+      : null;
+
+  const nomeDestinoExibicao =
+    porto?.nome || proximaEscalaNome || rotaOficial?.destino;
+
+  const latitudeAtualRastro = Number(
+    barcoSelecionadoAtual?.ultima_posicao?.latitude,
+  );
+  const longitudeAtualRastro = Number(
+    barcoSelecionadoAtual?.ultima_posicao?.longitude,
+  );
+
+  const posicaoAtualRastro =
+    Number.isFinite(latitudeAtualRastro) &&
+    Number.isFinite(longitudeAtualRastro) &&
+    latitudeAtualRastro !== 0 &&
+    longitudeAtualRastro !== 0
+      ? {
+          latitude: latitudeAtualRastro,
+          longitude: longitudeAtualRastro,
+        }
+      : null;
+
+  const podeExibirPercurso = mostrarPercurso && Boolean(barco?.id);
+
+  const segmentosRotaSelecionada = podeExibirPercurso
+    ? escolherSegmentosDaViagemAtual({
+        pontos: rotaAoVivo,
+        inicioViagemMs: estadoOperacional.inicioRastroMs || 0,
+        posicaoAtual: posicaoAtualRastro,
+      })
+    : [];
+
+  const segmentosRotaSincronizados = limitarLinhaAteBarcoVisual(
+    segmentosRotaSelecionada,
+    coordenadaVisualBarco || posicaoAtualRastro,
+  );
+
+  const rotaSelecionada = segmentosRotaSincronizados.flat();
+
+  const velocidadeOficialKmh = obterVelocidadeOperacionalKmh(
+    barcoSelecionadoAtual,
+  );
+
+  const estadoOperacionalExibicao = viagemConcluidaPelaRota
+    ? {
+        ...estadoOperacional,
+        codigo: "viagem_concluida" as const,
+        titulo: "Viagem concluída",
+        detalhe: estadoOperacional.proximaSaidaTexto
+          ? `Próxima saída: ${estadoOperacional.proximaSaidaTexto}`
+          : "A embarcação chegou ao destino final",
+        permiteEta: false,
+      }
+    : estadoOperacional.codigo === "parado_escala" && proximaEscalaNome
+      ? {
+          ...estadoOperacional,
+          detalhe: `Parado durante a viagem. Próximo porto: ${proximaEscalaNome}`,
+        }
+      : estadoOperacional;
+
+  const corEstadoOperacional =
+    estadoOperacionalExibicao.codigo === "em_viagem"
+      ? "#10b981"
+      : estadoOperacionalExibicao.codigo === "aguardando_saida"
+        ? "#fbbf24"
+        : estadoOperacionalExibicao.codigo === "parado_escala"
+          ? "#f97316"
+          : estadoOperacionalExibicao.codigo === "viagem_concluida"
+            ? "#a78bfa"
+            : "#94a3b8";
+
+  const iconeEstadoOperacional: React.ComponentProps<typeof Ionicons>["name"] =
+    estadoOperacionalExibicao.codigo === "em_viagem"
+      ? "navigate-circle-outline"
+      : estadoOperacionalExibicao.codigo === "aguardando_saida"
+        ? "time-outline"
+        : estadoOperacionalExibicao.codigo === "parado_escala"
+          ? "pause-circle-outline"
+          : estadoOperacionalExibicao.codigo === "viagem_concluida"
+            ? "checkmark-circle-outline"
+            : "calendar-outline";
+
+  return (
+    <View style={styles.container}>
+      {/* soccer-field layout text cleaner */}
+
+      {/* 1. PAINEL DE VIAGEM ATUALIZADO */}
+      {painelVisivel && (barcoRealtime || barco) && (
+        <View
+          style={[
+            styles.painelViagem,
+            { top: topoSeguroMapa },
+            telaCompacta && styles.painelViagemCompacto,
+            telaTablet && styles.painelViagemTablet,
+          ]}
+        >
+          <View style={styles.headerPainel}>
+            <Text style={styles.painelTitulo} numberOfLines={1}>
+              🛳️ {(barcoRealtime || barco).nome}
+            </Text>
+            {(barcoRealtime || barco).ultima_posicao?.visto_por_ultimo && (
+              <Text style={styles.txtSinal}>
+                Sinal:{" "}
+                {new Date(
+                  (barcoRealtime || barco).ultima_posicao.visto_por_ultimo,
+                ).toLocaleTimeString("pt-BR", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </Text>
+            )}
+          </View>
+
+          <View style={styles.statsContainer}>
+            <View style={styles.statItem}>
+              <Ionicons name="speedometer-outline" size={16} color="#38bdf8" />
+              <Text style={styles.statValor}>
+                {velocidadeOficialKmh > 0
+                  ? Math.round(velocidadeOficialKmh)
+                  : "--"}{" "}
+                <Text style={styles.statUnit}>km/h</Text>
+              </Text>
+            </View>
+
+            <View style={styles.statDivider} />
+
+            <View style={styles.statItem}>
+              {carregandoClima && !dadosClima ? (
+                <ActivityIndicator size="small" color="#38bdf8" />
+              ) : dadosClima ? (
+                <>
+                  <Ionicons
+                    name={obterIconeClima(
+                      dadosClima.condicao,
+                      dadosClima.icone,
+                    )}
+                    size={16}
+                    color={
+                      dadosClima.condicao.toLowerCase().includes("rain") ||
+                      dadosClima.condicao.toLowerCase().includes("drizzle")
+                        ? "#38bdf8"
+                        : "#fbbf24"
+                    }
+                  />
+                  <Text style={styles.statValor}>{dadosClima.temp}°</Text>
+                </>
+              ) : (
+                <>
+                  <Ionicons
+                    name="cloud-offline-outline"
+                    size={16}
+                    color="#94a3b8"
+                  />
+                  <Text
+                    style={styles.statValor}
+                    accessibilityLabel={erroClima || "Clima indisponível"}
+                  >
+                    --°
+                  </Text>
+                </>
+              )}
+            </View>
+          </View>
+
+          <View
+            style={[
+              styles.estadoOperacionalBox,
+              { borderColor: `${corEstadoOperacional}66` },
+            ]}
+          >
+            <Ionicons
+              name={iconeEstadoOperacional}
+              size={18}
+              color={corEstadoOperacional}
+            />
+            <View style={styles.estadoOperacionalTextos}>
+              <Text
+                style={[
+                  styles.estadoOperacionalTitulo,
+                  { color: corEstadoOperacional },
+                ]}
+              >
+                {estadoOperacionalExibicao.titulo}
+              </Text>
+              <Text style={styles.estadoOperacionalDetalhe}>
+                {estadoOperacionalExibicao.detalhe}
+              </Text>
+            </View>
+          </View>
+
+          {/* ETA somente quando a programação e o GPS confirmam viagem ativa. */}
+          {exibirPrevisao && nomeDestinoExibicao ? (
+            <View
+              style={{ marginTop: 2, marginBottom: 1, paddingHorizontal: 1 }}
+            >
+              <Text
+                style={[
+                  styles.painelTextoStatus,
+                  { color: "#fff", fontSize: 13, fontWeight: "500" },
+                ]}
+              >
+                Aproximando do porto:{" "}
+                <Text style={styles.destaqueTexto}>
+                  {nomeDestinoExibicao.toUpperCase()}
+                </Text>{" "}
+                em{" "}
+                <Text style={styles.destaqueTexto}>{exibirPrevisao.tempo}</Text>
+              </Text>
+              <View style={styles.badgesLinha}>
+                <View style={styles.distanciaBadge}>
+                  <Text style={styles.distanciaTxt}>
+                    {exibirPrevisao.km} km restantes
+                  </Text>
+                </View>
+
+                {infoRotaOficial && rotaOficial && (
+                  <View style={styles.rotaOficialBadge}>
+                    <Ionicons
+                      name="git-branch-outline"
+                      size={12}
+                      color="#a7f3d0"
+                    />
+                    <Text style={styles.rotaOficialTexto}>Rota Oficial</Text>
+                  </View>
+                )}
+              </View>
+            </View>
+          ) : null}
+
+          {rotaNaoAtendida && (
+            <View style={styles.rotaNaoAtendidaBox}>
+              <Ionicons name="warning-outline" size={17} color="#fbbf24" />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rotaNaoAtendidaTitulo}>
+                  Rota não atendida
+                </Text>
+                <Text style={styles.rotaNaoAtendidaTexto}>
+                  Esta embarcação não atende o porto selecionado. Escolha um
+                  porto que faça parte da rota do barco.
+                </Text>
+              </View>
+            </View>
+          )}
+
+          {/* LINHA DO TEMPO DA ROTA COM CÁLCULO DE MINUTOS SINCRONIZADO VIA GPS */}
+          {escalasDoFirebase && escalasDoFirebase.length > 0 && (
+            <View style={styles.rotaTimelineContainer}>
+              <Text style={styles.rotaTimelineTitulo}>
+                Linha de Navegação do Trecho
+              </Text>
+
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.rotaScrollContent}
+              >
+                {(() => {
+                  const normalizar = (str: string) => {
+                    if (!str) return "";
+                    return str
+                      .normalize("NFD")
+                      .replace(/[\u0300-\u036f]/g, "")
+                      .toUpperCase()
+                      .trim();
+                  };
+
+                  const extrairNomePorto = (item: any) => {
+                    if (!item) return "";
+                    if (typeof item === "string") return item;
+                    return (
+                      item.porto ||
+                      item.nome ||
+                      item.local ||
+                      item.cidade ||
+                      Object.values(item)[0] ||
+                      ""
+                    );
+                  };
+
+                  const indiceAlvo = progressoRotaAtual?.indiceProximo ?? 0;
+
+                  const calcularMinutosAtePortoOtimizado = (
+                    portoNome: string,
+                  ) => {
+                    const barcoFoco = barcoRealtime || barco;
+                    const nomeAlvo = normalizar(portoNome);
+
+                    if (!barcoFoco?.ultima_posicao || !nomeAlvo) {
+                      return null;
+                    }
+
+                    const tPorto = terminais?.find((t: any) => {
+                      const nomesPossiveis = [
+                        t.nome,
+                        t.porto,
+                        t.cidade,
+                        t.local,
+                        t.id,
+                      ]
+                        .filter(Boolean)
+                        .map((nome) => normalizar(String(nome)));
+
+                      return nomesPossiveis.some(
+                        (nome) =>
+                          nome &&
+                          (nome === nomeAlvo ||
+                            nome.includes(nomeAlvo) ||
+                            nomeAlvo.includes(nome)),
+                      );
+                    });
+
+                    if (!tPorto) return null;
+
+                    const pLat = Number(
+                      tPorto.coordenadas?.lat ?? tPorto.coordenadas?.latitude,
+                    );
+                    const pLng = Number(
+                      tPorto.coordenadas?.lng ?? tPorto.coordenadas?.longitude,
+                    );
+
+                    const previsao = calcularPrevisaoAteCoordenada(
+                      barcoFoco,
+                      pLat,
+                      pLng,
+                    );
+
+                    return previsao?.minutos ?? null;
+                  };
+
+                  const ehVolta = sentidoEfetivo === "volta";
+
+                  return escalasDoFirebase.map(
+                    (itemRota: any, index: number) => {
+                      const nomePortoOriginal = String(
+                        extrairNomePorto(itemRota),
+                      ).toUpperCase();
+
+                      let status = "futuro";
+                      let minutosEstimados: number | null = Number.isFinite(
+                        Number(itemRota.minutos),
+                      )
+                        ? Number(itemRota.minutos)
+                        : null;
+
+                      const statusCalculado = progressoRotaAtual?.escalas.find(
+                        (escala) => escala.indiceOriginal === index,
+                      )?.status;
+
+                      if (statusCalculado) {
+                        status = statusCalculado;
+                      } else if (index < indiceAlvo) {
+                        status = "passou";
+                      } else if (index === indiceAlvo) {
+                        status = "proximo";
+                      } else {
+                        status = "futuro";
+                      }
+
+                      if (status === "proximo") {
+                        minutosEstimados =
+                          calcularMinutosAtePortoOtimizado(nomePortoOriginal);
+                      }
+
+                      const jaPassou = status === "passou";
+                      const ehOProximo = status === "proximo";
+
+                      return (
+                        <View key={index} style={styles.portoEstacaoWrapper}>
+                          {index > 0 && (
+                            <View
+                              style={[
+                                styles.linhaConectora,
+                                {
+                                  backgroundColor: "transparent",
+                                  height: "auto",
+                                  flexDirection: "row",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  paddingHorizontal: 4,
+                                },
+                              ]}
+                            >
+                              <Ionicons
+                                name={
+                                  ehVolta ? "chevron-back" : "chevron-forward"
+                                }
+                                size={12}
+                                color={jaPassou ? "#10b981" : "#334155"}
+                                style={{
+                                  opacity: jaPassou ? 1 : 0.4,
+                                  marginRight: -4,
+                                }}
+                              />
+                              <Ionicons
+                                name={
+                                  ehVolta ? "chevron-back" : "chevron-forward"
+                                }
+                                size={12}
+                                color={jaPassou ? "#10b981" : "#334155"}
+                                style={{ opacity: jaPassou ? 1 : 0.4 }}
+                              />
+                            </View>
+                          )}
+
+                          <View style={styles.pontoCentralizador}>
+                            <View
+                              style={[
+                                styles.bolaPorto,
+                                jaPassou && {
+                                  backgroundColor: "#10b981",
+                                  borderColor: "#020617",
+                                },
+                                ehOProximo && {
+                                  backgroundColor: "#020617",
+                                  borderColor: "#38bdf8",
+                                  borderWidth: 3,
+                                },
+                              ]}
+                            >
+                              {jaPassou ? (
+                                <Ionicons
+                                  name="checkmark"
+                                  size={10}
+                                  color="#fff"
+                                />
+                              ) : ehOProximo ? (
+                                <View style={styles.pontoPulsoInterno} />
+                              ) : (
+                                <View style={styles.pontoApagado} />
+                              )}
+                            </View>
+
+                            <Text
+                              style={[
+                                styles.nomePortoRota,
+                                jaPassou && { color: "#64748b" },
+                                ehOProximo && {
+                                  color: "#38bdf8",
+                                  fontWeight: "bold",
+                                },
+                              ]}
+                            >
+                              {nomePortoOriginal}
+                            </Text>
+
+                            <Text
+                              style={{
+                                color: jaPassou ? "#475569" : "#64748b",
+                                fontSize: 8,
+                                marginTop: 2,
+                              }}
+                            >
+                              {jaPassou
+                                ? "Concluído"
+                                : ehOProximo
+                                  ? permiteEtaAgora
+                                    ? "Aproximando"
+                                    : "Próximo porto"
+                                  : "Na sequência"}
+                            </Text>
+
+                            {ehOProximo && permiteEtaAgora && (
+                              <View style={styles.badgeMinutosFaltando}>
+                                <Text style={styles.txtMinutosFaltando}>
+                                  {minutosEstimados !== null
+                                    ? `~${minutosEstimados} min`
+                                    : "calculando"}
+                                </Text>
+                              </View>
+                            )}
+                          </View>
+                        </View>
+                      );
+                    },
+                  );
+                })()}
+              </ScrollView>
+            </View>
+          )}
+        </View>
+      )}
+
+      <MapView
+        ref={mapRef}
+        style={styles.map}
+        provider={Platform.OS === "android" ? PROVIDER_GOOGLE : undefined}
+        initialRegion={REGIAO_INICIAL_AM_PA}
+        minZoomLevel={4.5}
+        showsUserLocation={false}
+        showsMyLocationButton={false}
+        showsCompass={false}
+        toolbarEnabled={false}
+        zoomControlEnabled={false}
+        mapPadding={
+          mapaExpandido
+            ? { top: 10, right: 64, bottom: 0, left: 10 }
+            : { top: 10, right: 54, bottom: 0, left: 4 }
+        }
+        customMapStyle={
+          Platform.OS === "android" && tipoMapa === "standard"
+            ? cmbLightMapStyle
+            : []
+        }
+        mapType={tipoMapa}
+        onMapReady={() => setMapaPronto(true)}
+        onRegionChangeComplete={(region) => {
+          const regiaoLimitada = limitarRegiaoOperacional(region);
+
+          if (typeof setZoomAtual === "function") {
+            setZoomAtual(regiaoLimitada.latitudeDelta);
+          }
+
+          if (
+            regiaoFoiLimitada(region, regiaoLimitada) &&
+            !ajustandoLimiteMapaRef.current
+          ) {
+            ajustandoLimiteMapaRef.current = true;
+
+            mapRef.current?.animateToRegion(regiaoLimitada, 350);
+
+            setTimeout(() => {
+              ajustandoLimiteMapaRef.current = false;
+            }, 450);
+          }
+        }}
+      >
+        {terminais
+          ?.filter((t: any) =>
+            barco?.id && porto?.id ? t.id === porto.id : true,
+          )
+          .map((t: any) => {
+            const lat = Number(t.coordenadas?.lat ?? t.coordenadas?.latitude);
+            const lng = Number(t.coordenadas?.lng ?? t.coordenadas?.longitude);
+            if (isNaN(lat) || isNaN(lng)) return null;
+            const isSelecionado = porto?.id === t.id;
+            return (
+              <React.Fragment key={`p-${t.id}`}>
+                {isSelecionado && (
+                  <RadarNativo
+                    lat={lat}
+                    lng={lng}
+                    rgb="251, 191, 36"
+                    zoomDelta={zoomAtual}
+                  />
+                )}
+                <Marker
+                  key={`marker-porto-${t.id}-${nivelVisualPortos}-${isSelecionado}`}
+                  coordinate={{ latitude: lat, longitude: lng }}
+                  anchor={{ x: 0.5, y: isSelecionado ? 0.78 : 0.5 }}
+                  zIndex={isSelecionado ? 30 : 5}
+                  tracksViewChanges={false}
+                >
+                  <PortoMarker
+                    nomeCidade={obterNomeCidadePorto(t)}
+                    ativo={isSelecionado}
+                    nivel={nivelVisualPortos}
+                  />
+                </Marker>
+              </React.Fragment>
+            );
+          })}
+
+        {frota?.map((b: any) => {
+          const lat = Number(b.ultima_posicao?.latitude);
+          const lng = Number(b.ultima_posicao?.longitude);
+          if (isNaN(lat) || isNaN(lng)) return null;
+          const direcao = b.ultima_posicao?.direcao || 0;
+          const deveEspelhar = direcao >= 0 && direcao <= 180;
+          const statusSinal = verificarStatusSinal(
+            b.ultima_posicao?.visto_por_ultimo,
+          );
+          const isAtivo = barco?.id === b.id;
+
+          return (
+            <BarcoMarkerSuave
+              key={`b-${b.id}`}
+              b={b}
+              isAtivo={isAtivo}
+              statusSinal={statusSinal}
+              deveEspelhar={deveEspelhar}
+              zoomAtual={zoomAtual}
+              onCoordenadaVisualChange={
+                isAtivo ? atualizarCoordenadaVisualBarco : undefined
+              }
+            />
+          );
+        })}
+
+        {rotaOficialPontos.length > 1 && (
+          <Polyline
+            coordinates={rotaOficialPontos}
+            strokeColor="rgba(251, 191, 36, 0.72)"
+            strokeWidth={2}
+            lineJoin="round"
+            lineCap="round"
+          />
+        )}
+
+        {segmentosRotaSincronizados.map((segmento, indice) => (
+          <Polyline
+            key={`trajeto-real-${indice}`}
+            coordinates={segmento}
+            strokeColor="rgba(14, 165, 233, 0.82)"
+            strokeWidth={2}
+            lineJoin="round"
+            lineCap="round"
+            geodesic={false}
+          />
+        ))}
+      </MapView>
+
+      {statusFeedbackRota && (
+        <View
+          pointerEvents="none"
+          style={[
+            styles.feedbackRotaArea,
+            {
+              top: painelVisivel
+                ? topoSeguroMapa + (telaCompacta ? 148 : 174)
+                : topoSeguroMapa + 14,
+            },
+            telaCompacta && styles.feedbackRotaAreaCompacto,
+          ]}
+        >
+          <Animated.View
+            style={[
+              styles.feedbackRotaCartao,
+              statusFeedbackRota === "sucesso" &&
+                styles.feedbackRotaCartaoSucesso,
+              statusFeedbackRota === "erro" && styles.feedbackRotaCartaoErro,
+              estiloFeedbackRota,
+            ]}
+          >
+            <View
+              style={[
+                styles.feedbackRotaIcone,
+                statusFeedbackRota === "sucesso" &&
+                  styles.feedbackRotaIconeSucesso,
+                statusFeedbackRota === "erro" && styles.feedbackRotaIconeErro,
+              ]}
+            >
+              <Ionicons
+                name={
+                  statusFeedbackRota === "carregando"
+                    ? "boat"
+                    : statusFeedbackRota === "sucesso"
+                      ? "checkmark"
+                      : "alert"
+                }
+                size={20}
+                color={
+                  statusFeedbackRota === "carregando" ? "#7dd3fc" : "#ffffff"
+                }
+              />
+            </View>
+
+            <View style={styles.feedbackRotaConteudo}>
+              <Text style={styles.feedbackRotaTitulo} numberOfLines={1}>
+                {statusFeedbackRota === "carregando"
+                  ? "Carregando trajeto..."
+                  : statusFeedbackRota === "sucesso"
+                    ? "Trajeto carregado"
+                    : "Trajeto indisponível agora"}
+              </Text>
+
+              <Text style={styles.feedbackRotaSubtitulo} numberOfLines={2}>
+                {statusFeedbackRota === "carregando"
+                  ? "Buscando o percurso desta viagem. Aguarde um instante."
+                  : statusFeedbackRota === "sucesso"
+                    ? "A linha da viagem já está disponível no mapa."
+                    : "Toque no ícone da rota para tentar novamente."}
+              </Text>
+
+              {statusFeedbackRota === "carregando" && (
+                <View style={styles.feedbackRotaTrilho}>
+                  <View style={styles.feedbackRotaLinhaBase} />
+                  <View style={styles.feedbackRotaPontos}>
+                    {Array.from({ length: 9 }).map((_, indice) => (
+                      <View
+                        key={`feedback-rota-ponto-${indice}`}
+                        style={styles.feedbackRotaPonto}
+                      />
+                    ))}
+                  </View>
+
+                  <Animated.View
+                    style={[
+                      styles.feedbackRotaBrilho,
+                      estiloBrilhoFeedbackRota,
+                    ]}
+                  />
+
+                  <Animated.View
+                    style={[styles.feedbackRotaBarco, estiloBarcoFeedbackRota]}
+                  >
+                    <Ionicons name="boat" size={15} color="#e0f2fe" />
+                  </Animated.View>
+                </View>
+              )}
+            </View>
+          </Animated.View>
+        </View>
+      )}
+
+      <View
+        style={[
+          styles.ferramentasContainer,
+          { top: topoSeguroMapa },
+          telaCompacta && styles.ferramentasContainerCompacto,
+        ]}
+      >
+        <TouchableOpacity
+          onPress={() => {
+            interromperPercursoSeEstiverCarregando();
+            abrirAjuda();
+          }}
+          style={styles.btnAjuda}
+        >
+          <Animated.View style={estiloAnimadoIcone}>
+            <Ionicons
+              name="boat"
+              size={22}
+              color={barco?.id ? "#fbbf24" : "#38bdf8"}
+            />
+          </Animated.View>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.botaoFerramenta}
+          onPress={() => {
+            interromperPercursoSeEstiverCarregando();
+            setPainelVisivel((visivel) => !visivel);
+          }}
+        >
+          <Ionicons
+            name="information-circle-outline"
+            size={24}
+            color={painelVisivel ? "#FFD200" : "#38bdf8"}
+          />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.botaoFerramenta}
+          onPress={() => {
+            interromperPercursoSeEstiverCarregando();
+            toggleExpand();
+          }}
+        >
+          <Ionicons
+            name={mapaExpandido ? "contract" : "expand"}
+            size={20}
+            color="#38bdf8"
+          />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.botaoFerramenta}
+          onPress={() => {
+            interromperPercursoSeEstiverCarregando();
+            centralizarMapa();
+          }}
+        >
+          <Ionicons name="locate-outline" size={20} color="#38bdf8" />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.botaoFerramenta}
+          onPress={async () => {
+            interromperPercursoSeEstiverCarregando();
+
+            const proximoTipo =
+              tipoMapa === "standard"
+                ? "satellite"
+                : tipoMapa === "satellite"
+                  ? "hybrid"
+                  : "standard";
+
+            setTipoMapa(proximoTipo);
+
+            try {
+              await AsyncStorage.setItem("@cmb_tipo_mapa", proximoTipo);
+            } catch (error) {
+              console.warn("Erro ao salvar tipo do mapa:", error);
+            }
+          }}
+          accessibilityLabel="Alternar tipo do mapa"
+        >
+          <Ionicons
+            name={
+              tipoMapa === "standard"
+                ? "map-outline"
+                : tipoMapa === "satellite"
+                  ? "earth-outline"
+                  : "layers-outline"
+            }
+            size={20}
+            color="#38bdf8"
+          />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[
+            styles.botaoFerramenta,
+            mostrarPercurso &&
+              barco?.id && {
+                borderColor: "#38bdf8",
+                backgroundColor: "rgba(14, 116, 144, 0.55)",
+              },
+            carregandoPercurso && styles.botaoFerramentaCarregando,
+          ]}
+          onPress={() => {
+            if (
+              !barco?.id ||
+              carregandoPercurso ||
+              statusFeedbackRota === "carregando"
+            ) {
+              return;
+            }
+
+            if (mostrarPercurso) {
+              setMostrarPercurso(false);
+              setStatusFeedbackRota(null);
+              opacidadeFeedbackRota.value = 0;
+              escalaFeedbackRota.value = 0.96;
+              return;
+            }
+
+            // Inicia o feedback no mesmo toque, antes de qualquer leitura de
+            // cache ou chamada ao servidor.
+            inicioFeedbackRotaRef.current = Date.now();
+            carregandoPercursoRef.current = true;
+            setStatusFeedbackRota("carregando");
+            setCarregandoPercurso(true);
+            opacidadeFeedbackRota.value = withTiming(1, {
+              duration: 160,
+            });
+            escalaFeedbackRota.value = withTiming(1, {
+              duration: 160,
+            });
+            progressoFeedbackRota.value = 0;
+            progressoFeedbackRota.value = withRepeat(
+              withTiming(1, { duration: 1450 }),
+              -1,
+              false,
+            );
+            setMostrarPercurso(true);
+          }}
+          disabled={
+            !barco?.id ||
+            carregandoPercurso ||
+            statusFeedbackRota === "carregando"
+          }
+          accessibilityLabel={
+            carregandoPercurso
+              ? "Carregando trajeto, aguarde"
+              : mostrarPercurso
+                ? "Ocultar percurso"
+                : "Mostrar percurso"
+          }
+          accessibilityHint={
+            carregandoPercurso
+              ? "O trajeto está sendo preparado"
+              : "Mostra o trajeto da partida até a posição atual"
+          }
+          accessibilityState={{
+            disabled:
+              !barco?.id ||
+              carregandoPercurso ||
+              statusFeedbackRota === "carregando",
+            busy: carregandoPercurso,
+            selected: mostrarPercurso,
+          }}
+        >
+          {carregandoPercurso ? (
+            <ActivityIndicator size="small" color="#38bdf8" />
+          ) : (
+            <Ionicons
+              name={mostrarPercurso ? "git-branch" : "git-branch-outline"}
+              size={20}
+              color={barco?.id ? "#38bdf8" : "#475569"}
+            />
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  map: { width: "100%", height: "100%" },
+  iconBase: {
+    width: 38,
+    height: 38,
+    alignItems: "center",
+    backgroundColor: "transparent",
+    justifyContent: "center",
+    overflow: "visible",
+  },
+  portoMarkerContainer: {
+    width: 180,
+    height: 105,
+    alignItems: "center",
+    justifyContent: "flex-start",
+    overflow: "visible",
+  },
+
+  portoNomeBadge: {
+    marginTop: 0,
+    backgroundColor: "rgba(251, 191, 36, 0.96)",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.9)",
+    minWidth: 120,
+    maxWidth: 170,
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 10,
+  },
+
+  portoNomeTexto: {
+    color: "#020617",
+    fontSize: 10,
+    fontWeight: "900",
+    letterSpacing: 0.5,
+    textAlign: "center",
+  },
+
+  portoHalo: {
+    position: "absolute",
+    top: 34,
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: "rgba(251, 191, 36, 0.16)",
+    borderWidth: 1,
+    borderColor: "rgba(251, 191, 36, 0.35)",
+  },
+
+  portoIconCircle: {
+    marginTop: 12,
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "rgba(15, 23, 42, 0.96)",
+    borderWidth: 2,
+    borderColor: "rgba(251, 191, 36, 0.9)",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#fbbf24",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    elevation: 6,
+    zIndex: 8,
+  },
+
+  portoIconCircleAtivo: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: "#fbbf24",
+    borderColor: "#ffffff",
+    shadowOpacity: 0.7,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+
+  portoPontoInferior: {
+    marginTop: 3,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#fbbf24",
+    borderWidth: 1,
+    borderColor: "#020617",
+    zIndex: 8,
+  },
+
+  portoPontoInferiorAtivo: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: "#ffffff",
+    borderColor: "#fbbf24",
+  },
+  dicaContainer: {
+    position: "absolute",
+    top: 36,
+    alignSelf: "center",
+    backgroundColor: "rgba(15, 23, 42, 0.98)",
+    padding: 15,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.5)",
+    zIndex: 999,
+    width: "80%",
+    marginRight: 56,
+  },
+  dicaHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 8,
+  },
+  dicaTitulo: { color: "#fff", fontSize: 15, fontWeight: "bold" },
+  dicaTexto: { color: "#94a3b8", fontSize: 13, lineHeight: 18 },
+
+  // PAINEL DE VIAGEM ESTILIZADO
+  painelViagem: {
+    position: "absolute",
+    left: 10,
+    right: 62,
+    maxWidth: 620,
+    backgroundColor: "rgba(15, 23, 42, 0.96)",
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.38)",
+    zIndex: 50,
+    borderLeftWidth: 4,
+    borderLeftColor: "#38bdf8",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.28,
+    shadowRadius: 12,
+    elevation: 12,
+  },
+  painelViagemCompacto: {
+    left: 8,
+    right: 56,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderRadius: 16,
+  },
+  painelViagemTablet: {
+    left: 18,
+    right: undefined,
+    width: 560,
+  },
+  headerPainel: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 7,
+    gap: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,255,255,0.1)",
+    paddingBottom: 6,
+  },
+  painelTitulo: {
+    flex: 1,
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 0.2,
+  },
+  txtSinal: { color: "#64748b", fontSize: 10 },
+
+  statsContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(0,0,0,0.2)",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    gap: 12,
+  },
+  statItem: { flexDirection: "row", alignItems: "center", gap: 6 },
+  statValor: { color: "#fff", fontSize: 14, fontWeight: "bold" },
+  statUnit: { color: "#64748b", fontSize: 10, fontWeight: "normal" },
+  statDivider: {
+    width: 1,
+    height: 20,
+    backgroundColor: "rgba(255,255,255,0.1)",
+  },
+  estadoOperacionalBox: {
+    marginTop: 7,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    backgroundColor: "rgba(2, 6, 23, 0.42)",
+  },
+  estadoOperacionalTextos: { flex: 1 },
+  estadoOperacionalTitulo: {
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  estadoOperacionalDetalhe: {
+    marginTop: 2,
+    color: "#cbd5e1",
+    fontSize: 10,
+    lineHeight: 14,
+  },
+
+  infoDestinoContainer: { gap: 8 },
+  painelTextoStatus: { color: "#94a3b8", fontSize: 12, lineHeight: 18 },
+  destaqueTexto: { color: "#38bdf8", fontWeight: "bold" },
+  distanciaBadge: {
+    backgroundColor: "rgba(56, 189, 248, 0.1)",
+    alignSelf: "flex-start",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.2)",
+  },
+  distanciaTxt: { color: "#7dd3fc", fontSize: 11, fontWeight: "bold" },
+
+  rotaOficialBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    alignSelf: "flex-start",
+    backgroundColor: "rgba(16, 185, 129, 0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(16, 185, 129, 0.25)",
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  rotaOficialTexto: {
+    color: "#a7f3d0",
+    fontSize: 10,
+    fontWeight: "800",
+  },
+
+  feedbackRotaArea: {
+    position: "absolute",
+    left: 14,
+    right: 60,
+    alignItems: "center",
+    zIndex: 120,
+    elevation: 16,
+  },
+  feedbackRotaAreaCompacto: {
+    left: 8,
+    right: 54,
+  },
+  feedbackRotaCartao: {
+    width: "100%",
+    maxWidth: 410,
+    minHeight: 86,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 19,
+    backgroundColor: "rgba(2, 6, 23, 0.95)",
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.58)",
+    borderLeftWidth: 4,
+    borderLeftColor: "#38bdf8",
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: 7 },
+    shadowOpacity: 0.34,
+    shadowRadius: 15,
+    elevation: 16,
+  },
+  feedbackRotaCartaoSucesso: {
+    borderColor: "rgba(16, 185, 129, 0.62)",
+    borderLeftColor: "#10b981",
+  },
+  feedbackRotaCartaoErro: {
+    borderColor: "rgba(251, 191, 36, 0.64)",
+    borderLeftColor: "#fbbf24",
+  },
+  feedbackRotaIcone: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(14, 116, 144, 0.28)",
+    borderWidth: 1,
+    borderColor: "rgba(125, 211, 252, 0.48)",
+  },
+  feedbackRotaIconeSucesso: {
+    backgroundColor: "rgba(16, 185, 129, 0.92)",
+    borderColor: "rgba(167, 243, 208, 0.9)",
+  },
+  feedbackRotaIconeErro: {
+    backgroundColor: "rgba(217, 119, 6, 0.92)",
+    borderColor: "rgba(254, 240, 138, 0.9)",
+  },
+  feedbackRotaConteudo: {
+    flex: 1,
+    minWidth: 0,
+  },
+  feedbackRotaTitulo: {
+    color: "#f8fafc",
+    fontSize: 13,
+    fontWeight: "900",
+    letterSpacing: 0.15,
+  },
+  feedbackRotaSubtitulo: {
+    color: "#94a3b8",
+    fontSize: 10.5,
+    lineHeight: 14,
+    marginTop: 2,
+  },
+  feedbackRotaTrilho: {
+    position: "relative",
+    height: 22,
+    marginTop: 7,
+    marginRight: 4,
+    overflow: "hidden",
+    justifyContent: "center",
+  },
+  feedbackRotaLinhaBase: {
+    position: "absolute",
+    left: 6,
+    right: 6,
+    height: 2,
+    borderRadius: 1,
+    backgroundColor: "rgba(56, 189, 248, 0.18)",
+  },
+  feedbackRotaPontos: {
+    position: "absolute",
+    left: 6,
+    right: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  feedbackRotaPonto: {
+    width: 3,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: "rgba(125, 211, 252, 0.58)",
+  },
+  feedbackRotaBrilho: {
+    position: "absolute",
+    left: 6,
+    width: 54,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: "#38bdf8",
+    shadowColor: "#38bdf8",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.85,
+    shadowRadius: 5,
+    elevation: 5,
+  },
+  feedbackRotaBarco: {
+    position: "absolute",
+    left: 6,
+    top: 1,
+    width: 24,
+    height: 20,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(14, 116, 144, 0.95)",
+    borderWidth: 1,
+    borderColor: "rgba(224, 242, 254, 0.78)",
+    shadowColor: "#38bdf8",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.68,
+    shadowRadius: 4,
+    elevation: 6,
+  },
+  botaoFerramentaCarregando: {
+    borderColor: "rgba(125, 211, 252, 0.92)",
+    backgroundColor: "rgba(14, 116, 144, 0.72)",
+    opacity: 0.92,
+  },
+
+  ferramentasContainer: {
+    position: "absolute",
+    right: 8,
+    alignItems: "center",
+    gap: 4,
+    zIndex: 100,
+    paddingHorizontal: 4,
+    paddingVertical: 5,
+    borderRadius: 24,
+    backgroundColor: "rgba(2, 6, 23, 0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.18)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.24,
+    shadowRadius: 8,
+    elevation: 10,
+  },
+  ferramentasContainerCompacto: {
+    right: 6,
+    gap: 3,
+    paddingHorizontal: 3,
+    paddingVertical: 4,
+  },
+  botaoFerramenta: {
+    backgroundColor: "rgba(15, 23, 42, 0.86)",
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.46)",
+  },
+  markerRelativo: { position: "relative" },
+  badgeAlertaGlobal: {
+    position: "absolute",
+    top: 0,
+    right: 8,
+    backgroundColor: "#fff",
+    borderRadius: 10,
+    width: 10,
+    height: 10,
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 99,
+    elevation: 10,
+  },
+  btnAjuda: {
+    width: 36,
+    height: 36,
+    backgroundColor: "rgba(30, 41, 59, 0.9)",
+    borderRadius: 18,
+    justifyContent: "center",
+    alignItems: "center",
+    elevation: 10,
+    borderWidth: 1,
+    borderColor: "rgba(56, 189, 248, 0.6)",
+  },
+  rotaTimelineContainer: {
+    marginTop: 6,
+    paddingTop: 4,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(56, 189, 248, 0.1)",
+  },
+  rotaTimelineTitulo: {
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 0.8,
+    paddingBottom: 4,
+  },
+  rotaScrollContent: {
+    paddingRight: 10,
+    alignItems: "center",
+    paddingVertical: 1,
+  },
+  portoEstacaoWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  linhaConectora: {
+    width: 32,
+    height: "auto",
+    marginHorizontal: -2,
+    zIndex: 1,
+  },
+  pontoCentralizador: {
+    alignItems: "center",
+    zIndex: 2,
+    minWidth: 70,
+  },
+  bolaPorto: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: "#1e293b",
+    borderWidth: 2,
+    borderColor: "#475569",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  pontoPulsoInterno: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#38bdf8",
+  },
+  pontoApagado: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#475569",
+  },
+  nomePortoRota: {
+    color: "#cbd5e1",
+    fontSize: 9,
+    marginTop: 5,
+    textAlign: "center",
+    fontWeight: "600",
+  },
+  badgeMinutosFaltando: {
+    backgroundColor: "rgba(56, 189, 248, 0.15)",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    marginTop: 4,
+    borderWidth: 0.5,
+    borderColor: "rgba(56, 189, 248, 0.3)",
+  },
+  txtMinutosFaltando: {
+    color: "#38bdf8",
+    fontSize: 9,
+    fontWeight: "bold",
+  },
+  portoIcone: {
+    width: 30,
+    height: 30,
+    borderRadius: 17,
+    backgroundColor: "rgba(15, 23, 42, 0.95)",
+    borderWidth: 2,
+    borderColor: "#fbbf24",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#fbbf24",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.45,
+    shadowRadius: 6,
+    elevation: 8,
+  },
+
+  portoIconeAtivo: {
+    width: 30,
+    height: 30,
+    borderRadius: 21,
+    backgroundColor: "#fbbf24",
+    borderColor: "#ffffff",
+    shadowOpacity: 0.8,
+    shadowRadius: 10,
+    elevation: 12,
+  },
+
+  rotaNaoAtendidaBox: {
+    marginTop: 8,
+    backgroundColor: "rgba(251, 191, 36, 0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(251, 191, 36, 0.35)",
+    borderRadius: 12,
+    padding: 10,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+  },
+
+  rotaNaoAtendidaTitulo: {
+    color: "#fbbf24",
+    fontSize: 12,
+    fontWeight: "900",
+    marginBottom: 2,
+  },
+
+  rotaNaoAtendidaTexto: {
+    color: "#cbd5e1",
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  badgesLinha: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 6,
+    flexWrap: "nowrap",
+  },
+});

@@ -1,0 +1,22 @@
+ARQUIVOS FINAIS — CADÊ MEU BARCO
+
+Os arquivos principais estão na raiz deste ZIP com os nomes exatos
+utilizados pelo projeto. Extraia e substitua os arquivos de mesmo nome
+dentro da pasta assets do app.
+
+Arquivos para substituir:
+- icon.png
+- android-icon-foreground.png
+- android-icon-background.png
+- android-icon-monochrome.png
+- favicon.png
+- logo_barco.png
+- Logo reduzida o tamanho.png
+- splash-icon.png
+- splash_vazia.png
+
+Arquivo separado para a ficha da Google Play:
+- icone-play-store-512x512.png
+
+A pasta ORIGINAIS_ENVIADOS contém uma cópia das imagens que você enviou.
+A pasta PREVIAS mostra como o ícone fica em máscaras comuns do Android.

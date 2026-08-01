@@ -1,48 +1,135 @@
 {
   "expo": {
-    "name": "app-passageiro",
-    "slug": "app-passageiro",
-    "version": "1.0.0",
+    "name": "Cadê Meu Barco",
+    "slug": "cadeomeubarco",
+    "version": "1.0.3",
     "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
-    "scheme": "apppassageiro",
+    "icon": "./assets/icon.png",
+    "scheme": "cadeomeubarco",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "owner": "jhanhouzer",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cademeubarco.passageiro",
+      "config": {
+        "usesNonExemptEncryption": false
+      }
     },
     "android": {
+      "package": "com.cademeubarco.passageiro",
+      "googleServicesFile": "./google-services.json",
+      "versionCode": 14,
+      "softwareKeyboardLayoutMode": "pan",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "backgroundColor": "#020617",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyD43nyoKrMr-NcgYosODsjojAdIWWDH340"
+        }
+      },
+      "blockedPermissions": [
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO"
+      ]
     },
     "web": {
-      "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "output": "single",
+      "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-router",
       [
-        "expo-splash-screen",
+        "expo-build-properties",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
-          "dark": {
-            "backgroundColor": "#000000"
+          "android": {
+            "largeHeap": true
           }
         }
-      ]
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#020617",
+          "image": "./assets/splash_vazia.png",
+          "dark": {
+            "backgroundColor": "#020617"
+          }
+        }
+      ],
+      "@react-native-community/datetimepicker",
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-font",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Permita que o Cadê Meu Barco use sua localização para mostrar sua posição no mapa e recursos próximos."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permita que o Cadê Meu Barco use a câmera para validar bilhetes e ler códigos QR.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Permita que o Cadê Meu Barco acesse suas fotos para escolher uma imagem de perfil ou da embarcação.",
+          "cameraPermission": "Permita que o Cadê Meu Barco use a câmera para criar uma imagem de perfil ou da embarcação.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Permita que o Cadê Meu Barco acesse suas fotos quando você solicitar.",
+          "savePhotosPermission": "Permita que o Cadê Meu Barco salve bilhetes e imagens na sua galeria.",
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": [
+            "photo"
+          ]
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Permita que o Cadê Meu Barco use o Face ID para proteger o acesso à sua conta."
+        }
+      ],
+      "expo-notifications"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "32558343-1438-488e-9ee6-af11d5bc46bb"
+      }
+    },
+    "updates": {
+      "url": "https://u.expo.dev/32558343-1438-488e-9ee6-af11d5bc46bb"
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
     }
   }
 }

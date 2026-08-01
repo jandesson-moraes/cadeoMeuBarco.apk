@@ -1,0 +1,637 @@
+import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useRouter } from "expo-router";
+import {
+  addDoc,
+  collection,
+  limit,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  where,
+} from "firebase/firestore";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Image,
+  Linking,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  useWindowDimensions,
+  View,
+} from "react-native";
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withSpring,
+  withTiming,
+} from "react-native-reanimated";
+import { db } from "../services/firebase";
+
+type ContextoBanner = "global" | "selecao_embarcacao";
+type Frequencia = "sessao" | "dia" | "selecao" | "intervalo";
+type EventoMetrica = "impressao" | "clique" | "fechamento";
+
+type BannerModalProps = {
+  contexto?: ContextoBanner;
+  cidadeUsuario?: string;
+  barcosCompradosIds?: string[];
+  userId?: string;
+  barcoSelecionadoId?: string;
+  barcoSelecionadoNome?: string;
+  selecaoNonce?: number;
+};
+
+const FUSO_HORARIO = "America/Manaus";
+const IDS_VAZIOS: string[] = [];
+
+const vistosNaSessao = new Set<string>();
+
+function normalizarTexto(valor?: string) {
+  return String(valor || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function dataValida(valor: any) {
+  if (!valor) return null;
+  const data = typeof valor?.toDate === "function" ? valor.toDate() : new Date(valor);
+  return Number.isNaN(data.getTime()) ? null : data;
+}
+
+function partesManaus(data = new Date()) {
+  const formatador = new Intl.DateTimeFormat("en-US", {
+    timeZone: FUSO_HORARIO,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    weekday: "short",
+  });
+
+  const partes = Object.fromEntries(
+    formatador
+      .formatToParts(data)
+      .filter((parte) => parte.type !== "literal")
+      .map((parte) => [parte.type, parte.value]),
+  );
+
+  const mapaDia: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+
+  return {
+    chaveData: `${partes.year}-${partes.month}-${partes.day}`,
+    diaSemana: mapaDia[partes.weekday] ?? data.getDay(),
+    horario: `${partes.hour}:${partes.minute}`,
+  };
+}
+
+function dentroDaFaixaHorario(inicio: string, fim: string, atual: string) {
+  if (!inicio || !fim) return true;
+  if (inicio === fim) return true;
+  if (inicio < fim) return atual >= inicio && atual <= fim;
+  return atual >= inicio || atual <= fim;
+}
+
+function bannerVigente(banner: any, agora = new Date()) {
+  if (banner.publicado === false || banner.ativo === false) return false;
+
+  const inicio = dataValida(banner.vigenciaInicioIso || banner.vigenciaInicio);
+  const fim = dataValida(banner.vigenciaFimIso || banner.vigenciaFim);
+
+  if (inicio && agora.getTime() < inicio.getTime()) return false;
+  if (fim && agora.getTime() > fim.getTime()) return false;
+
+  const partes = partesManaus(agora);
+  const dias = Array.isArray(banner.diasSemana)
+    ? banner.diasSemana.map(Number).filter(Number.isInteger)
+    : [];
+
+  if (dias.length > 0 && !dias.includes(partes.diaSemana)) return false;
+
+  if (
+    banner.restringirHorario === true &&
+    !dentroDaFaixaHorario(
+      String(banner.horarioInicio || ""),
+      String(banner.horarioFim || ""),
+      partes.horario,
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function idsAlvo(banner: any) {
+  if (Array.isArray(banner.barcosIdsAlvo)) {
+    return banner.barcosIdsAlvo.map(String).filter(Boolean);
+  }
+  return [banner.barcoIdAlvo || banner.barcoId].map(String).filter(Boolean);
+}
+
+function podeExibirParaPublico(
+  banner: any,
+  cidadeUsuario: string,
+  barcosCompradosIds: string[],
+  barcoSelecionadoId: string,
+) {
+  const publico = banner.publicoAlvo || banner.publico || "todos";
+
+  if (publico === "todos") return true;
+
+  if (publico === "cidade") {
+    return (
+      normalizarTexto(banner.cidadeAlvo || banner.cidadeAlvoNormalizada) ===
+      normalizarTexto(cidadeUsuario)
+    );
+  }
+
+  if (publico === "comprou_barco") {
+    const alvos = idsAlvo(banner);
+    return alvos.some((id: string) => barcosCompradosIds.map(String).includes(id));
+  }
+
+  if (publico === "embarcacoes") {
+    if (!barcoSelecionadoId) return false;
+    const alvos = idsAlvo(banner);
+    return alvos.length === 0 || alvos.includes(String(barcoSelecionadoId));
+  }
+
+  return false;
+}
+
+function gatilhoDoBanner(banner: any) {
+  if (banner.gatilhoExibicao) return banner.gatilhoExibicao;
+  if (banner.momentoExibicao === "agora") return "imediato";
+
+  // Campanhas antigas com "após um tempo" eram globais.
+  // As novas campanhas por seleção sempre salvam gatilhoExibicao explicitamente.
+  return "ao_abrir_app";
+}
+
+function disparoForcado(banner: any) {
+  const limite = dataValida(banner.forcarExibicaoAteIso);
+  return Boolean(limite && Date.now() <= limite.getTime());
+}
+
+function pertenceAoContexto(banner: any, contexto: ContextoBanner) {
+  if (disparoForcado(banner)) return true;
+  const gatilho = gatilhoDoBanner(banner);
+  if (contexto === "selecao_embarcacao") return gatilho === "selecao_embarcacao";
+  return gatilho === "ao_abrir_app" || gatilho === "imediato";
+}
+
+function atrasoDoBanner(banner: any, contexto: ContextoBanner) {
+  if (disparoForcado(banner) || gatilhoDoBanner(banner) === "imediato") return 300;
+  if (contexto === "global") {
+    if (!banner.gatilhoExibicao && banner.momentoExibicao === "apos_tempo") {
+      const legado = Number(banner.tempoDepoisSegundos || 15);
+      return Math.max(3, Math.min(300, legado)) * 1000;
+    }
+    return 1200;
+  }
+  const segundos = Number(
+    banner.atrasoSegundos ?? banner.tempoDepoisSegundos ?? 20,
+  );
+  if (segundos <= 0) return -1;
+
+  const atrasosPermitidos = [3, 5, 10, 20, 30, 40];
+  if (!atrasosPermitidos.includes(segundos)) return 20 * 1000;
+
+  return segundos * 1000;
+}
+
+function frequenciaDoBanner(banner: any): Frequencia {
+  if (["sessao", "dia", "selecao", "intervalo"].includes(banner.frequencia)) {
+    return banner.frequencia;
+  }
+  return banner.mostrarUmaVez !== false ? "sessao" : "dia";
+}
+
+async function respeitaFrequencia(
+  banner: any,
+  contexto: ContextoBanner,
+  barcoId: string,
+  selecaoNonce: number,
+) {
+  const frequencia = frequenciaDoBanner(banner);
+  const base = `${banner.id}_${contexto}_${barcoId || "global"}`;
+  const partes = partesManaus();
+
+  if (frequencia === "sessao") {
+    return !vistosNaSessao.has(base);
+  }
+
+  if (frequencia === "selecao") {
+    return !vistosNaSessao.has(`${base}_${selecaoNonce}`);
+  }
+
+  const chave = `@cmb_banner_frequencia_${base}`;
+  const salvo = await AsyncStorage.getItem(chave);
+
+  if (frequencia === "dia") {
+    return salvo !== partes.chaveData;
+  }
+
+  const ultimo = Number(salvo || 0);
+  const intervaloMs = Math.max(1, Number(banner.intervaloMinimoMinutos || 60)) * 60_000;
+  return !ultimo || Date.now() - ultimo >= intervaloMs;
+}
+
+async function marcarFrequencia(
+  banner: any,
+  contexto: ContextoBanner,
+  barcoId: string,
+  selecaoNonce: number,
+) {
+  const frequencia = frequenciaDoBanner(banner);
+  const base = `${banner.id}_${contexto}_${barcoId || "global"}`;
+
+  if (frequencia === "sessao") {
+    vistosNaSessao.add(base);
+    return;
+  }
+
+  if (frequencia === "selecao") {
+    vistosNaSessao.add(`${base}_${selecaoNonce}`);
+    return;
+  }
+
+  const chave = `@cmb_banner_frequencia_${base}`;
+  await AsyncStorage.setItem(
+    chave,
+    frequencia === "dia" ? partesManaus().chaveData : String(Date.now()),
+  );
+}
+
+function textoTipo(tipo: string) {
+  const mapa: Record<string, string> = {
+    promocao: "Promoção",
+    escala: "Escala",
+    alteracao_horario: "Alteração de horário",
+    alteracao_rota: "Alteração de rota",
+    aviso_operacional: "Aviso operacional",
+    venda_passagem: "Passagem",
+    servico: "Serviço",
+    informativo: "Informativo",
+    aviso: "Aviso",
+  };
+  return mapa[tipo] || "Informativo";
+}
+
+export default function BannerModal({
+  contexto = "global",
+  cidadeUsuario = "",
+  barcosCompradosIds = IDS_VAZIOS,
+  userId = "anonimo",
+  barcoSelecionadoId = "",
+  barcoSelecionadoNome = "",
+  selecaoNonce = 0,
+}: BannerModalProps) {
+  const router = useRouter();
+  const { width, height } = useWindowDimensions();
+  const [visivel, setVisivel] = useState(false);
+  const [banner, setBanner] = useState<any>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoCloseRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const impressaoRegistradaRef = useRef("");
+
+  const opacity = useSharedValue(0);
+  const scale = useSharedValue(0.94);
+  const translateY = useSharedValue(35);
+
+  const registrarMetrica = async (tipo: EventoMetrica, campanha = banner) => {
+    if (!campanha?.id) return;
+    try {
+      await addDoc(collection(db, "banner_metricas_eventos"), {
+        bannerId: campanha.id,
+        tipo,
+        barcoId: barcoSelecionadoId || "",
+        contexto,
+        uid: userId === "anonimo" ? "" : userId,
+        criadoEm: serverTimestamp(),
+      });
+    } catch {
+      // Métricas nunca podem bloquear a experiência do passageiro.
+    }
+  };
+
+  useEffect(() => {
+    if (contexto === "selecao_embarcacao" && !barcoSelecionadoId) {
+      setBanner(null);
+      setVisivel(false);
+      return;
+    }
+
+    const consulta = query(
+      collection(db, "banners_promocionais"),
+      where("ativo", "==", true),
+      limit(30),
+    );
+
+    const unsubscribe = onSnapshot(consulta, (snapshot) => {
+      const executar = async () => {
+        if (timerRef.current) clearTimeout(timerRef.current);
+        if (autoCloseRef.current) clearTimeout(autoCloseRef.current);
+        setVisivel(false);
+
+        const campanhas = snapshot.docs
+          .map((item) => ({ id: item.id, ...item.data() }))
+          .filter((item) => bannerVigente(item))
+          .filter((item) => pertenceAoContexto(item, contexto))
+          .filter((item) =>
+            podeExibirParaPublico(
+              item,
+              cidadeUsuario,
+              barcosCompradosIds,
+              barcoSelecionadoId,
+            ),
+          )
+          .sort((a: any, b: any) => {
+            const prioridade = Number(b.prioridade || 0) - Number(a.prioridade || 0);
+            if (prioridade !== 0) return prioridade;
+            return (dataValida(b.atualizadoEm || b.createdAt)?.getTime() || 0) -
+              (dataValida(a.atualizadoEm || a.createdAt)?.getTime() || 0);
+          });
+
+        let elegivel: any = null;
+        for (const item of campanhas) {
+          if (await respeitaFrequencia(item, contexto, barcoSelecionadoId, selecaoNonce)) {
+            elegivel = item;
+            break;
+          }
+        }
+
+        if (!elegivel) {
+          setBanner(null);
+          return;
+        }
+
+        const atraso = atrasoDoBanner(elegivel, contexto);
+        if (atraso < 0) {
+          setBanner(null);
+          return;
+        }
+
+        setBanner(elegivel);
+        timerRef.current = setTimeout(() => {
+          setVisivel(true);
+          opacity.value = withTiming(1, { duration: 260 });
+          scale.value = withSpring(1, { damping: 17, stiffness: 120 });
+          translateY.value = withSpring(0, { damping: 18, stiffness: 120 });
+        }, atraso);
+      };
+
+      void executar();
+    });
+
+    return () => {
+      unsubscribe();
+      if (timerRef.current) clearTimeout(timerRef.current);
+      if (autoCloseRef.current) clearTimeout(autoCloseRef.current);
+    };
+  }, [
+    barcoSelecionadoId,
+    barcosCompradosIds,
+    cidadeUsuario,
+    contexto,
+    opacity,
+    scale,
+    selecaoNonce,
+    translateY,
+  ]);
+
+  useEffect(() => {
+    if (!visivel || !banner) return;
+
+    const chave = `${banner.id}_${contexto}_${barcoSelecionadoId}_${selecaoNonce}`;
+    if (impressaoRegistradaRef.current !== chave) {
+      impressaoRegistradaRef.current = chave;
+      void marcarFrequencia(banner, contexto, barcoSelecionadoId, selecaoNonce);
+      void registrarMetrica("impressao", banner);
+    }
+
+    const duracao = Number(banner.duracaoAbertoSegundos || 0);
+    if (duracao > 0) {
+      autoCloseRef.current = setTimeout(() => fechar(false), duracao * 1000);
+    }
+
+    return () => {
+      if (autoCloseRef.current) clearTimeout(autoCloseRef.current);
+    };
+  }, [banner, barcoSelecionadoId, contexto, selecaoNonce, visivel]);
+
+  const estiloAnimado = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+    transform: [{ scale: scale.value }, { translateY: translateY.value }],
+  }));
+
+  const imagemUrl = useMemo(
+    () => String(banner?.imageUrl || banner?.imagemUrl || ""),
+    [banner],
+  );
+
+  const fechar = (registrar = true) => {
+    if (autoCloseRef.current) clearTimeout(autoCloseRef.current);
+    if (registrar) void registrarMetrica("fechamento");
+    opacity.value = withTiming(0, { duration: 180 });
+    scale.value = withTiming(0.97, { duration: 180 });
+    translateY.value = withTiming(24, { duration: 180 });
+    setTimeout(() => setVisivel(false), 190);
+  };
+
+  const executarAcao = async () => {
+    if (!banner) return;
+    void registrarMetrica("clique");
+
+    const acao = banner.acaoTipo || (banner.linkDestino ? "link" : "nenhuma");
+    const barcoId = barcoSelecionadoId || idsAlvo(banner)[0] || "";
+
+    try {
+      if (acao === "detalhes" && barcoId) {
+        router.push({ pathname: "/detalhes-barco", params: { barcoId } } as any);
+      } else if (acao === "itinerario" && barcoId) {
+        router.push({
+          pathname: "/detalhes-barco",
+          params: { barcoId, secao: "itinerario" },
+        } as any);
+      } else if (acao === "vendas" && barcoId) {
+        router.push({ pathname: "/(tabs)/vendas", params: { barcoId } } as any);
+      } else if (acao === "whatsapp") {
+        const numero = String(banner.acaoDestino || "").replace(/\D/g, "");
+        const mensagem = encodeURIComponent(
+          `Olá! Vi uma informação da embarcação ${barcoSelecionadoNome || banner.barcoNomeAlvo || ""} no app Cadê Meu Barco.`,
+        );
+        if (numero) await Linking.openURL(`https://wa.me/${numero}?text=${mensagem}`);
+      } else if (acao === "link") {
+        const link = String(banner.acaoDestino || banner.linkDestino || "");
+        if (/^https?:\/\//i.test(link)) await Linking.openURL(link);
+      }
+    } finally {
+      fechar(false);
+    }
+  };
+
+  if (!banner) return null;
+
+  const cardWidth = Math.min(width - 24, 460);
+  const cardMaxHeight = Math.min(height - (Platform.OS === "ios" ? 80 : 44), 720);
+  const temAcao = (banner.acaoTipo || (banner.linkDestino ? "link" : "nenhuma")) !== "nenhuma";
+
+  return (
+    <Modal visible={visivel} transparent animationType="none" statusBarTranslucent>
+      <View style={styles.overlay}>
+        <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => fechar()} />
+        <Animated.View style={[styles.card, { width: cardWidth, maxHeight: cardMaxHeight }, estiloAnimado]}>
+          <View style={styles.cabecalho}>
+            <View style={styles.badges}>
+              <View style={styles.badgeTipo}>
+                <Text style={styles.badgeTexto}>{textoTipo(banner.tipo)}</Text>
+              </View>
+              {!!barcoSelecionadoNome && contexto === "selecao_embarcacao" && (
+                <View style={styles.badgeBarco}>
+                  <Ionicons name="boat-outline" size={13} color="#dff6ff" />
+                  <Text style={styles.badgeBarcoTexto} numberOfLines={1}>{barcoSelecionadoNome}</Text>
+                </View>
+              )}
+            </View>
+            <TouchableOpacity onPress={() => fechar()} style={styles.fechar} accessibilityLabel="Fechar banner">
+              <Ionicons name="close" size={23} color="#fff" />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView bounces={false} showsVerticalScrollIndicator={false} contentContainerStyle={styles.conteudoScroll}>
+            {imagemUrl ? (
+              <Image source={{ uri: imagemUrl }} style={styles.imagem} resizeMode="cover" />
+            ) : (
+              <View style={styles.semImagem}>
+                <Ionicons name="megaphone-outline" size={58} color="#7dd3fc" />
+              </View>
+            )}
+
+            <View style={styles.conteudo}>
+              {!!banner.subtitulo && <Text style={styles.subtitulo}>{banner.subtitulo}</Text>}
+              <Text style={styles.titulo}>{banner.titulo}</Text>
+              <Text style={styles.mensagem}>{banner.mensagem}</Text>
+
+              {temAcao && (
+                <TouchableOpacity style={styles.botaoAcao} onPress={executarAcao} activeOpacity={0.85}>
+                  <Text style={styles.botaoAcaoTexto}>{banner.botaoTexto || "Ver agora"}</Text>
+                  <Ionicons name="arrow-forward" size={17} color="#0f2240" />
+                </TouchableOpacity>
+              )}
+            </View>
+          </ScrollView>
+        </Animated.View>
+      </View>
+    </Modal>
+  );
+}
+
+const styles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 12,
+    backgroundColor: "rgba(1, 8, 20, 0.82)",
+  },
+  card: {
+    overflow: "hidden",
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: "rgba(125, 211, 252, 0.45)",
+    backgroundColor: "#071a31",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 18 },
+    shadowOpacity: 0.42,
+    shadowRadius: 26,
+    elevation: 22,
+  },
+  cabecalho: {
+    minHeight: 58,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    backgroundColor: "#0f2240",
+  },
+  badges: { flex: 1, flexDirection: "row", alignItems: "center", gap: 7 },
+  badgeTipo: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(125, 211, 252, 0.35)",
+    backgroundColor: "rgba(56, 189, 248, 0.12)",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  badgeTexto: { color: "#dff6ff", fontSize: 10, fontWeight: "900", textTransform: "uppercase" },
+  badgeBarco: {
+    minWidth: 0,
+    maxWidth: "65%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    borderRadius: 999,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  badgeBarcoTexto: { flexShrink: 1, color: "#dff6ff", fontSize: 10, fontWeight: "800" },
+  fechar: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.10)",
+  },
+  conteudoScroll: { flexGrow: 1 },
+  imagem: { width: "100%", height: 270, backgroundColor: "#0f2240" },
+  semImagem: {
+    height: 180,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#123760",
+  },
+  conteudo: { padding: 20 },
+  subtitulo: {
+    marginBottom: 7,
+    color: "#7dd3fc",
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+  },
+  titulo: { color: "#fff", fontSize: 24, lineHeight: 29, fontWeight: "900" },
+  mensagem: { marginTop: 10, color: "rgba(224,242,254,0.78)", fontSize: 15, lineHeight: 23, fontWeight: "600" },
+  botaoAcao: {
+    minHeight: 50,
+    marginTop: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    borderRadius: 17,
+    backgroundColor: "#fff",
+    paddingHorizontal: 18,
+  },
+  botaoAcaoTexto: { color: "#0f2240", fontSize: 12, fontWeight: "900", textTransform: "uppercase" },
+});

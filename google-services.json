@@ -1,0 +1,76 @@
+{
+  "project_info": {
+    "project_number": "105733878321",
+    "project_id": "sistema-navegacao",
+    "storage_bucket": "sistema-navegacao.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:105733878321:android:09c13638bf5ecac974db10",
+        "android_client_info": {
+          "package_name": "com.cademeubarco.passageiro"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "105733878321-l9l0pelm19j5g7eog86iimqc771a86ck.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD_VjLW1K6n6Rt8r7rjH8526yb2h-M5g5w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "105733878321-l9l0pelm19j5g7eog86iimqc771a86ck.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:105733878321:android:830b65818758a0cd74db10",
+        "android_client_info": {
+          "package_name": "com.jandessonmoraes.cadeomeubarco"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "105733878321-kt65piugr3g8n9t6sqtcruq76bjc99hi.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.jandessonmoraes.cadeomeubarco",
+            "certificate_hash": "4feefd47bcd96aa2479ca4e3b0d272e87912ef65"
+          }
+        },
+        {
+          "client_id": "105733878321-l9l0pelm19j5g7eog86iimqc771a86ck.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD_VjLW1K6n6Rt8r7rjH8526yb2h-M5g5w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "105733878321-l9l0pelm19j5g7eog86iimqc771a86ck.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

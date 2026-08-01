@@ -1,0 +1,680 @@
+import { obterVelocidadeOficialKmh } from "./navegacaoInteligente";
+
+export type SentidoViagem = "ida" | "volta";
+
+export type ProgramacaoViagem = {
+  id: string;
+  barcoId: string;
+  gradeId: string;
+  sentido: SentidoViagem;
+  diasSemana: number[];
+  horarioSaida: string;
+  duracaoPrevistaMinutos: number;
+  timezone: string;
+  vigenciaInicio: string | null;
+  vigenciaFim: string | null;
+  ativo: boolean;
+  antecedenciaExibicaoMin: number;
+  toleranciaSaidaMin: number;
+  velocidadeMinimaViagemKmh: number;
+  origem?: string;
+  destino?: string;
+  origemCidade?: string;
+  destinoCidade?: string;
+  origemPortoId?: string;
+  destinoPortoId?: string;
+  origemPortoNome?: string;
+  destinoPortoNome?: string;
+  origemCoordenadas?: any;
+  destinoCoordenadas?: any;
+  escalas?: any[];
+  itinerario?: any[];
+  nome?: string;
+  origemDados?: "programacao" | "grade_legada";
+  original?: any;
+};
+
+export type TipoPontoItinerario = "origem" | "escala" | "destino";
+
+export type PontoItinerarioViagem = {
+  id: string;
+  ordem: number;
+  tipo: TipoPontoItinerario;
+  cidade: string;
+  uf: string;
+  portoId: string;
+  portoNome: string;
+  coordenadas: { lat: number; lng: number } | null;
+  diaRelativo: number;
+  diasPassagem: number[];
+  horarioChegada: string;
+  horarioSaida: string;
+};
+
+export type OcorrenciaViagem = {
+  programacao: ProgramacaoViagem;
+  inicioMs: number;
+  fimMs: number;
+  dataLocal: string;
+};
+
+export type CodigoEstadoOperacional =
+  | "sem_programacao"
+  | "aguardando_saida"
+  | "em_viagem"
+  | "parado_escala"
+  | "viagem_concluida";
+
+export type EstadoOperacionalViagem = {
+  codigo: CodigoEstadoOperacional;
+  titulo: string;
+  detalhe: string;
+  permiteEta: boolean;
+  viagemAtiva: boolean;
+  deveCarregarRastro: boolean;
+  inicioRastroMs: number | null;
+  ocorrenciaAtual: OcorrenciaViagem | null;
+  proximaOcorrencia: OcorrenciaViagem | null;
+  proximaSaidaTexto: string | null;
+};
+
+const DIA_MS = 24 * 60 * 60 * 1000;
+const MINUTO_MS = 60 * 1000;
+const FUSO_PADRAO = "America/Manaus";
+
+const numeroSeguro = (valor: any, padrao: number): number => {
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : padrao;
+};
+
+const textoSeguro = (valor: any): string => String(valor || "").trim();
+
+const numeroOuNull = (valor: any): number | null => {
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : null;
+};
+
+const cidadeCompleta = (cidade: any, uf: any): string => {
+  const textoCidade = textoSeguro(cidade);
+  if (!textoCidade) return "";
+  if (/\s-\s[A-Za-z]{2}$/.test(textoCidade)) return textoCidade;
+  const sigla = textoSeguro(uf).toUpperCase();
+  return sigla ? `${textoCidade} - ${sigla}` : textoCidade;
+};
+
+const coordenadasDoPonto = (ponto: any) => {
+  const lat = numeroOuNull(
+    ponto?.coordenadas?.lat ??
+      ponto?.coordenadas?.latitude ??
+      ponto?.latitude ??
+      ponto?.lat,
+  );
+  const lng = numeroOuNull(
+    ponto?.coordenadas?.lng ??
+      ponto?.coordenadas?.longitude ??
+      ponto?.longitude ??
+      ponto?.lng ??
+      ponto?.lon,
+  );
+  if (lat === null || lng === null) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+};
+
+const normalizarTipoPonto = (valor: any, index: number, total: number): TipoPontoItinerario => {
+  const tipo = textoSeguro(valor).toLowerCase();
+  if (tipo === "origem" || tipo === "destino" || tipo === "escala") return tipo;
+  if (index === 0) return "origem";
+  if (index === total - 1) return "destino";
+  return "escala";
+};
+
+export const normalizarPontoItinerario = (
+  ponto: any,
+  index: number,
+  total: number,
+): PontoItinerarioViagem => {
+  const tipo = normalizarTipoPonto(ponto?.tipo, index, total);
+  const portoId = textoSeguro(
+    ponto?.portoId || ponto?.terminalId || ponto?.id,
+  );
+  const portoNome = textoSeguro(
+    ponto?.portoNome || ponto?.porto || ponto?.nome || ponto?.local,
+  );
+  return {
+    id: portoId || `${tipo}_${index}`,
+    ordem: numeroSeguro(ponto?.ordem, index),
+    tipo,
+    cidade: cidadeCompleta(
+      ponto?.cidade || ponto?.municipio || ponto?.localidade,
+      ponto?.uf || ponto?.estado,
+    ),
+    uf: textoSeguro(ponto?.uf || ponto?.estado).toUpperCase(),
+    portoId,
+    portoNome,
+    coordenadas: coordenadasDoPonto(ponto),
+    diaRelativo: Math.max(
+      0,
+      numeroSeguro(ponto?.diaRelativo ?? ponto?.dias_apos_saida, 0),
+    ),
+    diasPassagem: normalizarDiasSemana(
+      ponto?.diasPassagem || ponto?.dias_passagem,
+    ),
+    horarioChegada: textoSeguro(ponto?.horarioChegada || ponto?.horario),
+    horarioSaida: textoSeguro(ponto?.horarioSaida),
+  };
+};
+
+export const obterItinerarioProgramacao = (dados: any): PontoItinerarioViagem[] => {
+  const listaOriginal = Array.isArray(dados?.itinerario)
+    ? dados.itinerario
+    : Array.isArray(dados?.escalas)
+      ? dados.escalas
+      : [];
+
+  if (listaOriginal.length > 0) {
+    return listaOriginal
+      .map((ponto: any, index: number) =>
+        normalizarPontoItinerario(ponto, index, listaOriginal.length),
+      )
+      .sort((a: PontoItinerarioViagem, b: PontoItinerarioViagem) => a.ordem - b.ordem);
+  }
+
+  const origem = {
+    tipo: "origem",
+    ordem: 0,
+    cidade: dados?.origemCidade || dados?.origem,
+    portoId: dados?.origemPortoId,
+    portoNome: dados?.origemPortoNome || dados?.portoOrigem,
+    coordenadas: dados?.origemCoordenadas,
+    horarioSaida: dados?.horarioSaida,
+  };
+  const destino = {
+    tipo: "destino",
+    ordem: 1,
+    cidade: dados?.destinoCidade || dados?.destino,
+    portoId: dados?.destinoPortoId,
+    portoNome: dados?.destinoPortoNome || dados?.portoDestino,
+    coordenadas: dados?.destinoCoordenadas,
+  };
+  return [
+    normalizarPontoItinerario(origem, 0, 2),
+    normalizarPontoItinerario(destino, 1, 2),
+  ].filter((ponto) => ponto.cidade || ponto.portoNome);
+};
+
+const normalizarSentido = (valor: any): SentidoViagem =>
+  String(valor || "").toLowerCase() === "volta" ? "volta" : "ida";
+
+const normalizarDiasSemana = (valor: any): number[] => {
+  const origem = Array.isArray(valor) ? valor : [];
+
+  return Array.from(
+    new Set(
+      origem
+        .map((item) => {
+          if (typeof item === "number") return item;
+          if (typeof item === "string" && /^\d+$/.test(item.trim())) {
+            return Number(item);
+          }
+          if (typeof item === "object") {
+            if (item.ativo === false) return null;
+            return Number(item.id ?? item.dia ?? item.valor);
+          }
+          return null;
+        })
+        .filter(
+          (item): item is number =>
+            typeof item === "number" &&
+            Number.isInteger(item) &&
+            item >= 0 &&
+            item <= 6,
+        ),
+    ),
+  ).sort((a, b) => a - b);
+};
+
+const normalizarHorario = (valor: any, padrao = "08:00"): string => {
+  const texto = textoSeguro(valor);
+  const match = texto.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return padrao;
+
+  const hora = Math.min(23, Math.max(0, Number(match[1])));
+  const minuto = Math.min(59, Math.max(0, Number(match[2])));
+  return `${String(hora).padStart(2, "0")}:${String(minuto).padStart(2, "0")}`;
+};
+
+const dataIsoOuNull = (valor: any): string | null => {
+  const texto = textoSeguro(valor);
+  return /^\d{4}-\d{2}-\d{2}$/.test(texto) ? texto : null;
+};
+
+export const normalizarProgramacaoViagem = (
+  id: string,
+  dados: any,
+): ProgramacaoViagem => ({
+  id,
+  barcoId: textoSeguro(dados?.barcoId || dados?.embarcacaoId),
+  gradeId: textoSeguro(dados?.gradeId),
+  sentido: normalizarSentido(dados?.sentido),
+  diasSemana: normalizarDiasSemana(
+    dados?.diasSemana || dados?.dias_da_semana || dados?.dias,
+  ),
+  horarioSaida: normalizarHorario(
+    dados?.horarioSaida || dados?.horario_saida || dados?.horaSaida,
+  ),
+  duracaoPrevistaMinutos: Math.max(
+    30,
+    numeroSeguro(
+      dados?.duracaoPrevistaMinutos ??
+        dados?.tempoTotalMin ??
+        dados?.duracaoMinutos,
+      24 * 60,
+    ),
+  ),
+  timezone: textoSeguro(dados?.timezone || dados?.fusoHorario) || FUSO_PADRAO,
+  vigenciaInicio: dataIsoOuNull(dados?.vigenciaInicio),
+  vigenciaFim: dataIsoOuNull(dados?.vigenciaFim),
+  ativo: dados?.ativo !== false,
+  antecedenciaExibicaoMin: Math.max(
+    0,
+    numeroSeguro(dados?.antecedenciaExibicaoMin, 120),
+  ),
+  toleranciaSaidaMin: Math.max(
+    0,
+    numeroSeguro(dados?.toleranciaSaidaMin, 90),
+  ),
+  velocidadeMinimaViagemKmh: Math.max(
+    0.5,
+    numeroSeguro(dados?.velocidadeMinimaViagemKmh, 2),
+  ),
+  origem: textoSeguro(dados?.origem || dados?.origemCidade || dados?.portoOrigem),
+  destino: textoSeguro(dados?.destino || dados?.destinoCidade || dados?.portoDestino),
+  origemCidade: textoSeguro(dados?.origemCidade || dados?.origem),
+  destinoCidade: textoSeguro(dados?.destinoCidade || dados?.destino),
+  origemPortoId: textoSeguro(dados?.origemPortoId),
+  destinoPortoId: textoSeguro(dados?.destinoPortoId),
+  origemPortoNome: textoSeguro(dados?.origemPortoNome || dados?.portoOrigem),
+  destinoPortoNome: textoSeguro(dados?.destinoPortoNome || dados?.portoDestino),
+  origemCoordenadas: dados?.origemCoordenadas || null,
+  destinoCoordenadas: dados?.destinoCoordenadas || null,
+  escalas: obterItinerarioProgramacao(dados),
+  itinerario: obterItinerarioProgramacao(dados),
+  nome: textoSeguro(dados?.nome),
+  origemDados: dados?.origemDados === "grade_legada" ? "grade_legada" : "programacao",
+  original: dados,
+});
+
+const minutosDoHorario = (horario: string): number => {
+  const [hora, minuto] = normalizarHorario(horario).split(":").map(Number);
+  return hora * 60 + minuto;
+};
+
+const estimarDuracaoDaGrade = (grade: any): number => {
+  const explicita = numeroSeguro(
+    grade?.duracaoPrevistaMinutos ?? grade?.tempoTotalMin,
+    0,
+  );
+  if (explicita > 0) return Math.max(30, explicita);
+
+  const horarioSaida = normalizarHorario(
+    grade?.horarioSaida || grade?.horario_saida,
+  );
+  const itinerario = Array.isArray(grade?.itinerario)
+    ? grade.itinerario
+    : Array.isArray(grade?.escalas)
+      ? grade.escalas
+      : [];
+  const ultima = itinerario[itinerario.length - 1] || {};
+  const diasDepois = Math.max(
+    0,
+    numeroSeguro(ultima?.dias_apos_saida ?? ultima?.diaRelativo, 0),
+  );
+  const horarioChegada = normalizarHorario(
+    ultima?.horario || ultima?.horarioChegada,
+    horarioSaida,
+  );
+
+  let duracao =
+    diasDepois * 24 * 60 +
+    minutosDoHorario(horarioChegada) -
+    minutosDoHorario(horarioSaida);
+
+  if (duracao <= 0) duracao += 24 * 60;
+  return Math.max(30, duracao || 24 * 60);
+};
+
+export const montarProgramacoesLegadas = (
+  grades: any[],
+  barcoId: string,
+): ProgramacaoViagem[] => {
+  return grades
+    .filter(Boolean)
+    .map((grade: any, index: number) => {
+      const gradeId = textoSeguro(grade?.id) || `${barcoId}_${normalizarSentido(grade?.sentido)}`;
+      const dados = {
+        ...grade,
+        barcoId,
+        gradeId,
+        diasSemana: grade?.diasSemana || grade?.dias_da_semana,
+        horarioSaida: grade?.horarioSaida || grade?.horario_saida,
+        duracaoPrevistaMinutos: estimarDuracaoDaGrade(grade),
+        origemDados: "grade_legada",
+      };
+
+      return normalizarProgramacaoViagem(
+        `legada_${gradeId}_${index}`,
+        dados,
+      );
+    })
+    .filter(
+      (programacao) =>
+        programacao.ativo && programacao.diasSemana.length > 0,
+    );
+};
+
+type PartesData = {
+  ano: number;
+  mes: number;
+  dia: number;
+  hora: number;
+  minuto: number;
+};
+
+const partesNoFuso = (data: Date, timezone: string): PartesData => {
+  const formatador = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const partes = formatador.formatToParts(data);
+  const obter = (tipo: string) =>
+    Number(partes.find((parte) => parte.type === tipo)?.value || 0);
+
+  return {
+    ano: obter("year"),
+    mes: obter("month"),
+    dia: obter("day"),
+    hora: obter("hour"),
+    minuto: obter("minute"),
+  };
+};
+
+const dataLocalParaUtcMs = ({
+  ano,
+  mes,
+  dia,
+  hora,
+  minuto,
+  timezone,
+}: PartesData & { timezone: string }): number => {
+  const alvoComoUtc = Date.UTC(ano, mes - 1, dia, hora, minuto, 0, 0);
+  let palpite = alvoComoUtc;
+
+  for (let tentativa = 0; tentativa < 4; tentativa += 1) {
+    const localDoPalpite = partesNoFuso(new Date(palpite), timezone);
+    const localComoUtc = Date.UTC(
+      localDoPalpite.ano,
+      localDoPalpite.mes - 1,
+      localDoPalpite.dia,
+      localDoPalpite.hora,
+      localDoPalpite.minuto,
+      0,
+      0,
+    );
+    palpite += alvoComoUtc - localComoUtc;
+  }
+
+  return palpite;
+};
+
+const dataIso = (ano: number, mes: number, dia: number): string =>
+  `${String(ano).padStart(4, "0")}-${String(mes).padStart(2, "0")}-${String(
+    dia,
+  ).padStart(2, "0")}`;
+
+const estaDentroDaVigencia = (
+  dataLocal: string,
+  programacao: ProgramacaoViagem,
+): boolean => {
+  if (programacao.vigenciaInicio && dataLocal < programacao.vigenciaInicio) {
+    return false;
+  }
+  if (programacao.vigenciaFim && dataLocal > programacao.vigenciaFim) {
+    return false;
+  }
+  return true;
+};
+
+const gerarOcorrencias = (
+  programacoes: ProgramacaoViagem[],
+  agoraMs: number,
+): OcorrenciaViagem[] => {
+  const ocorrencias: OcorrenciaViagem[] = [];
+
+  for (const programacao of programacoes) {
+    if (!programacao.ativo || programacao.diasSemana.length === 0) continue;
+
+    const timezone = programacao.timezone || FUSO_PADRAO;
+    const hojeLocal = partesNoFuso(new Date(agoraMs), timezone);
+    const baseCalendario = Date.UTC(
+      hojeLocal.ano,
+      hojeLocal.mes - 1,
+      hojeLocal.dia,
+      12,
+      0,
+      0,
+      0,
+    );
+
+    for (let deslocamento = -10; deslocamento <= 21; deslocamento += 1) {
+      const calendario = new Date(baseCalendario + deslocamento * DIA_MS);
+      const ano = calendario.getUTCFullYear();
+      const mes = calendario.getUTCMonth() + 1;
+      const dia = calendario.getUTCDate();
+      const diaSemana = calendario.getUTCDay();
+      const localIso = dataIso(ano, mes, dia);
+
+      if (!programacao.diasSemana.includes(diaSemana)) continue;
+      if (!estaDentroDaVigencia(localIso, programacao)) continue;
+
+      const [hora, minuto] = programacao.horarioSaida.split(":").map(Number);
+      const inicioMs = dataLocalParaUtcMs({
+        ano,
+        mes,
+        dia,
+        hora,
+        minuto,
+        timezone,
+      });
+
+      ocorrencias.push({
+        programacao,
+        inicioMs,
+        fimMs: inicioMs + programacao.duracaoPrevistaMinutos * MINUTO_MS,
+        dataLocal: localIso,
+      });
+    }
+  }
+
+  return ocorrencias.sort((a, b) => a.inicioMs - b.inicioMs);
+};
+
+const formatarOcorrencia = (
+  ocorrencia: OcorrenciaViagem,
+  agoraMs: number,
+): string => {
+  const timezone = ocorrencia.programacao.timezone || FUSO_PADRAO;
+  const agoraLocal = partesNoFuso(new Date(agoraMs), timezone);
+  const amanhaCalendario = new Date(
+    Date.UTC(agoraLocal.ano, agoraLocal.mes - 1, agoraLocal.dia) + DIA_MS,
+  );
+  const hojeIso = dataIso(agoraLocal.ano, agoraLocal.mes, agoraLocal.dia);
+  const amanhaIso = dataIso(
+    amanhaCalendario.getUTCFullYear(),
+    amanhaCalendario.getUTCMonth() + 1,
+    amanhaCalendario.getUTCDate(),
+  );
+
+  const horario = ocorrencia.programacao.horarioSaida;
+  if (ocorrencia.dataLocal === hojeIso) return `hoje às ${horario}`;
+  if (ocorrencia.dataLocal === amanhaIso) return `amanhã às ${horario}`;
+
+  const textoData = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: timezone,
+    weekday: "long",
+    day: "2-digit",
+    month: "2-digit",
+  }).format(new Date(ocorrencia.inicioMs));
+
+  return `${textoData} às ${horario}`;
+};
+
+export const calcularEstadoOperacionalViagem = ({
+  programacoes,
+  barco,
+  agoraMs = Date.now(),
+}: {
+  programacoes: ProgramacaoViagem[];
+  barco: any;
+  agoraMs?: number;
+}): EstadoOperacionalViagem => {
+  const validas = programacoes.filter(
+    (programacao) => programacao.ativo && programacao.diasSemana.length > 0,
+  );
+  const ocorrencias = gerarOcorrencias(validas, agoraMs);
+  const proximaOcorrencia =
+    ocorrencias.find((ocorrencia) => ocorrencia.inicioMs > agoraMs) || null;
+
+  const ocorrenciaAtual =
+    [...ocorrencias]
+      .reverse()
+      .find((ocorrencia) => {
+        const antecedencia =
+          ocorrencia.programacao.antecedenciaExibicaoMin * MINUTO_MS;
+        return (
+          agoraMs >= ocorrencia.inicioMs - antecedencia &&
+          agoraMs <= ocorrencia.fimMs
+        );
+      }) || null;
+
+  const ultimaOcorrencia =
+    [...ocorrencias]
+      .reverse()
+      .find((ocorrencia) => ocorrencia.fimMs < agoraMs) || null;
+
+  const proximaSaidaTexto = proximaOcorrencia
+    ? formatarOcorrencia(proximaOcorrencia, agoraMs)
+    : null;
+
+  if (!ocorrenciaAtual) {
+    const terminouRecentemente =
+      ultimaOcorrencia && agoraMs - ultimaOcorrencia.fimMs <= 6 * 60 * MINUTO_MS;
+
+    if (terminouRecentemente) {
+      return {
+        codigo: "viagem_concluida",
+        titulo: "Viagem concluída",
+        detalhe: proximaSaidaTexto
+          ? `Próxima saída: ${proximaSaidaTexto}`
+          : "Nenhuma nova saída programada",
+        permiteEta: false,
+        viagemAtiva: false,
+        deveCarregarRastro: false,
+        inicioRastroMs: null,
+        ocorrenciaAtual: null,
+        proximaOcorrencia,
+        proximaSaidaTexto,
+      };
+    }
+
+    return {
+      codigo: "sem_programacao",
+      titulo: validas.length > 0 ? "Sem viagem no momento" : "Sem programação cadastrada",
+      detalhe: proximaSaidaTexto
+        ? `Próxima saída: ${proximaSaidaTexto}`
+        : "Não há saída futura cadastrada",
+      permiteEta: false,
+      viagemAtiva: false,
+      deveCarregarRastro: false,
+      inicioRastroMs: null,
+      ocorrenciaAtual: null,
+      proximaOcorrencia,
+      proximaSaidaTexto,
+    };
+  }
+
+  const programacao = ocorrenciaAtual.programacao;
+  const velocidadeKmh = obterVelocidadeOficialKmh(barco) ?? 0;
+  const antesDaSaida = agoraMs < ocorrenciaAtual.inicioMs;
+  const minutosDesdeSaida =
+    (agoraMs - ocorrenciaAtual.inicioMs) / MINUTO_MS;
+
+  if (antesDaSaida) {
+    return {
+      codigo: "aguardando_saida",
+      titulo: "Aguardando saída",
+      detalhe: `Saída programada para ${formatarOcorrencia(
+        ocorrenciaAtual,
+        agoraMs,
+      )}`,
+      permiteEta: false,
+      viagemAtiva: true,
+      deveCarregarRastro: false,
+      inicioRastroMs: ocorrenciaAtual.inicioMs,
+      ocorrenciaAtual,
+      proximaOcorrencia,
+      proximaSaidaTexto,
+    };
+  }
+
+  if (velocidadeKmh >= programacao.velocidadeMinimaViagemKmh) {
+    return {
+      codigo: "em_viagem",
+      titulo: "Em viagem",
+      detalhe: `${programacao.origem || "Origem"} → ${
+        programacao.destino || "destino programado"
+      }`,
+      permiteEta: true,
+      viagemAtiva: true,
+      deveCarregarRastro: true,
+      inicioRastroMs: ocorrenciaAtual.inicioMs,
+      ocorrenciaAtual,
+      proximaOcorrencia,
+      proximaSaidaTexto,
+    };
+  }
+
+  if (minutosDesdeSaida <= programacao.toleranciaSaidaMin) {
+    return {
+      codigo: "aguardando_saida",
+      titulo: "Aguardando saída",
+      detalhe: `Horário programado: ${programacao.horarioSaida}`,
+      permiteEta: false,
+      viagemAtiva: true,
+      deveCarregarRastro: false,
+      inicioRastroMs: ocorrenciaAtual.inicioMs,
+      ocorrenciaAtual,
+      proximaOcorrencia,
+      proximaSaidaTexto,
+    };
+  }
+
+  return {
+    codigo: "parado_escala",
+    titulo: "Em viagem, mas parado",
+    detalhe: "A previsão será atualizada quando a embarcação voltar a navegar",
+    permiteEta: false,
+    viagemAtiva: true,
+    deveCarregarRastro: true,
+    inicioRastroMs: ocorrenciaAtual.inicioMs,
+    ocorrenciaAtual,
+    proximaOcorrencia,
+    proximaSaidaTexto,
+  };
+};
