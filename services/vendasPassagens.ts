@@ -170,6 +170,58 @@ export function deveExibirBotaoComprar(barco: any) {
   );
 }
 
+export function obterTarifaTrecho(
+  grade: any,
+  origem: string,
+  destino: string,
+) {
+  const tarifas = Array.isArray(grade?.tarifasTrechos)
+    ? grade.tarifasTrechos
+    : [];
+  if (!tarifas.length) return null;
+
+  const itinerario = Array.isArray(grade?.itinerario)
+    ? grade.itinerario
+    : Array.isArray(grade?.escalas)
+      ? grade.escalas
+      : [];
+  const encontrarPonto = (valor: string) => {
+    const procurado = normalizarChaveBusca(valor).split(" - ")[0];
+    return itinerario.find((ponto: any) =>
+      [ponto?.porto, ponto?.nome, ponto?.cidade].some(
+        (campo) =>
+          normalizarChaveBusca(campo).split(" - ")[0] === procurado,
+      ),
+    );
+  };
+
+  const pontoOrigem = encontrarPonto(origem);
+  const pontoDestino = encontrarPonto(destino);
+  const origemId = String(pontoOrigem?.portoId || pontoOrigem?.id || "");
+  const destinoId = String(pontoDestino?.portoId || pontoDestino?.id || "");
+  const origemNormalizada = normalizarChaveBusca(origem).split(" - ")[0];
+  const destinoNormalizado = normalizarChaveBusca(destino).split(" - ")[0];
+
+  return (
+    tarifas.find((tarifa: any) => {
+      if (tarifa?.ativo === false) return false;
+      const correspondeIds =
+        origemId &&
+        destinoId &&
+        String(tarifa?.origemPortoId || "") === origemId &&
+        String(tarifa?.destinoPortoId || "") === destinoId;
+      const correspondeNomes =
+        normalizarChaveBusca(tarifa?.origemNome || tarifa?.origem).split(
+          " - ",
+        )[0] === origemNormalizada &&
+        normalizarChaveBusca(tarifa?.destinoNome || tarifa?.destino).split(
+          " - ",
+        )[0] === destinoNormalizado;
+      return correspondeIds || correspondeNomes;
+    }) || null
+  );
+}
+
 /**
  * Apenas uma prévia visual no aplicativo.
  * O backend recalcula os valores oficiais antes de gerar o pagamento.

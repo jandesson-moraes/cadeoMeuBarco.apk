@@ -3,7 +3,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Haptics from "expo-haptics";
 import * as Location from "expo-location";
 import { router } from "expo-router";
-import { collection, doc, onSnapshot } from "firebase/firestore";
+import { onAuthStateChanged } from "firebase/auth";
+import { collection, doc, getDoc, onSnapshot } from "firebase/firestore";
 import React, { useEffect, useRef, useState } from "react";
 import {
   Linking,
@@ -33,7 +34,7 @@ import Animated, {
 import BannerModal from "../../components/BannerModal";
 import Footer from "../../components/Footer";
 import MapaView from "../../components/MapaView";
-import { db } from "../../services/firebase";
+import { auth, db } from "../../services/firebase";
 import { obterVelocidadeOficialKmh } from "../../services/navegacaoInteligente";
 import {
   CORES_PLANO,
@@ -207,6 +208,7 @@ export default function MapaExplorar() {
   const [portoSelecionado, setPortoSelecionado] = useState<any>(null);
 
   const [vendasAtivas, setVendasAtivas] = useState<boolean>(false);
+  const [pilotoMarketplace, setPilotoMarketplace] = useState(false);
 
   const [raioAlerta, setRaioAlerta] = useState(2.0);
   const [tempoAlerta, setTempoAlerta] = useState(30);
@@ -281,6 +283,25 @@ export default function MapaExplorar() {
       }
     }
     inicializarApp();
+  }, []);
+
+  useEffect(() => {
+    const cancelar = onAuthStateChanged(auth, async (usuario) => {
+      if (!usuario) {
+        setPilotoMarketplace(false);
+        return;
+      }
+      try {
+        const snapshot = await getDoc(doc(db, "usuarios", usuario.uid));
+        setPilotoMarketplace(
+          snapshot.exists() &&
+            snapshot.data().pilotoMarketplace === true,
+        );
+      } catch {
+        setPilotoMarketplace(false);
+      }
+    });
+    return cancelar;
   }, []);
 
   useEffect(() => {
@@ -980,7 +1001,7 @@ export default function MapaExplorar() {
               </TouchableOpacity>
             </View>
 
-            {vendasAtivas && (
+            {(vendasAtivas || pilotoMarketplace) && (
               <TouchableOpacity
                 style={styles.btnCheckout}
                 onPress={() => router.push("/(tabs)/vendas")}

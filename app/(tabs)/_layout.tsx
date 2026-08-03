@@ -20,6 +20,7 @@ export default function TabLayout() {
   const [isComandante, setIsComandante] = useState(false);
 
   const [vendasLiberadas, setVendasLiberadas] = useState(false);
+  const [pilotoMarketplace, setPilotoMarketplace] = useState(false);
 
   const insets = useSafeAreaInsets();
   const segments = useSegments();
@@ -28,10 +29,10 @@ export default function TabLayout() {
   // ⚓️ Lógica das abas visíveis (Ajustes removido para simplificar)
   const visibleTabs = useMemo(() => {
     const abas = ["explore"];
-    if (vendasLiberadas) abas.push("vendas");
+    if (vendasLiberadas || pilotoMarketplace) abas.push("vendas");
     abas.push("perfil");
     return abas;
-  }, [vendasLiberadas]);
+  }, [vendasLiberadas, pilotoMarketplace]);
 
   const tabWidth = larguraTela / visibleTabs.length;
   const telaCompacta = larguraTela < 360 || alturaTela < 680;
@@ -88,6 +89,11 @@ export default function TabLayout() {
               doc(db, "usuarios", usuarioAutenticado.uid),
             );
 
+            setPilotoMarketplace(
+              userDoc.exists() &&
+                userDoc.data().pilotoMarketplace === true,
+            );
+
             // 🟢 3. Se tiver o documento no Firebase, limpamos a palavra "dono" também
             let tipoUsuario = "";
             if (userDoc.exists() && userDoc.data().tipo) {
@@ -102,7 +108,10 @@ export default function TabLayout() {
             }
           } catch (error) {
             setIsComandante(false);
+            setPilotoMarketplace(false);
           }
+        } else {
+          setPilotoMarketplace(false);
         }
         setCarregandoIdentidade(false);
       };
@@ -175,7 +184,8 @@ export default function TabLayout() {
           name="vendas"
           options={{
             title: "PASSAGENS",
-            href: vendasLiberadas ? undefined : null,
+            href:
+              vendasLiberadas || pilotoMarketplace ? undefined : null,
             tabBarIcon: ({ color, focused }) => (
               <Ionicons
                 size={tamanhoIcone}

@@ -72,6 +72,7 @@ export default function PerfilScreen() {
   const [buscandoEmail, setBuscandoEmail] = useState(false);
   const [uploadingFotoPerfil, setUploadingFotoPerfil] = useState(false);
   const [vendasAtivas, setVendasAtivas] = useState<boolean>(false);
+  const [pilotoMarketplace, setPilotoMarketplace] = useState(false);
 
   // --- ESTADOS DO MARKETING DO BARCO ---
   const [modalMarketingVisivel, setModalMarketingVisivel] = useState(false);
@@ -177,6 +178,21 @@ export default function PerfilScreen() {
     );
     return () => unsubConfig();
   }, []);
+
+  useEffect(() => {
+    if (!user?.uid) {
+      setPilotoMarketplace(false);
+      return;
+    }
+    getDoc(doc(db, "usuarios", user.uid))
+      .then((snapshot) =>
+        setPilotoMarketplace(
+          snapshot.exists() &&
+            snapshot.data().pilotoMarketplace === true,
+        ),
+      )
+      .catch(() => setPilotoMarketplace(false));
+  }, [user?.uid]);
 
   useEffect(() => {
     let unsubBarcos = () => {};
@@ -1041,7 +1057,7 @@ export default function PerfilScreen() {
                 ? "CONTA DA TRIPULAÇÃO"
                 : "MINHA CONTA"}
           </Text>
-          {!isComandante && vendasAtivas && (
+          {!isComandante && (vendasAtivas || pilotoMarketplace) && (
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
@@ -1089,11 +1105,6 @@ export default function PerfilScreen() {
                   editandoMarketing.current = false;
                   setModalMarketingVisivel(true);
                 },
-              },
-              {
-                label: "Programação de viagens",
-                icon: "calendar-outline",
-                action: () => router.push("/config-barco"),
               },
               {
                 label: "Painel operacional",

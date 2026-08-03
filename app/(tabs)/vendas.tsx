@@ -19,6 +19,7 @@ import { db } from "../../services/firebase";
 import {
   deveExibirBotaoComprar,
   localizarBarcoDaGrade,
+  obterTarifaTrecho,
 } from "../../services/vendasPassagens";
 
 LocaleConfig.locales["pt-br"] = {
@@ -245,7 +246,12 @@ export default function VendasScreen() {
             };
           })
           .filter((grade: any) => {
-            if (!grade.vendasAtivas || !grade.barcoData) {
+            if (
+              !grade.vendasAtivas ||
+              !grade.barcoData ||
+              grade.ativo === false ||
+              grade.publicadoParaVenda === false
+            ) {
               return false;
             }
             const pOrigem = (grade.porto_origem || grade.portoOrigem || "")
@@ -288,8 +294,18 @@ export default function VendasScreen() {
                   escalas[idxO - 1].horario;
             grade.horarioChegadaExibicao =
               escalas[idxD].horario_chegada || escalas[idxD].horario;
+            const tarifaTrecho = obterTarifaTrecho(grade, origem, destino);
             grade.precoExibicao = parseFloat(
-              escalas[idxD].preco_da_origem || escalas[idxD].precoRede || 0,
+              tarifaTrecho?.precoRede ||
+                tarifaTrecho?.preco_rede ||
+                tarifaTrecho?.preco_da_origem ||
+                tarifaTrecho?.precoPoltrona ||
+                tarifaTrecho?.preco_poltrona ||
+                tarifaTrecho?.precoSuite ||
+                tarifaTrecho?.preco_suite ||
+                escalas[idxD].preco_da_origem ||
+                escalas[idxD].precoRede ||
+                0,
             );
             const inter = escalas.slice(idxO, idxD).map((e: any) => e.porto);
             grade.itinerarioFormatado =
