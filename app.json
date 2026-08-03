@@ -2,7 +2,7 @@
   "expo": {
     "name": "Cadê Meu Barco",
     "slug": "cadeomeubarco",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "cadeomeubarco",
@@ -102,9 +102,7 @@
           "photosPermission": "Permita que o Cadê Meu Barco acesse suas fotos quando você solicitar.",
           "savePhotosPermission": "Permita que o Cadê Meu Barco salve bilhetes e imagens na sua galeria.",
           "isAccessMediaLocationEnabled": false,
-          "granularPermissions": [
-            "photo"
-          ]
+          "granularPermissions": ["photo"]
         }
       ],
       [

@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Clipboard from "expo-clipboard";
+import * as WebBrowser from "expo-web-browser";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import {
   collection,
@@ -47,6 +48,9 @@ interface Passageiro {
   nacionalidade: string;
   nascimento: string;
 }
+
+const URL_CHECKOUT_MARKETPLACE =
+  "https://us-central1-sistema-navegacao.cloudfunctions.net/criarCheckoutVendaMarketplace";
 
 export default function CheckoutPassagem() {
   const insets = useSafeAreaInsets();
@@ -225,7 +229,16 @@ export default function CheckoutPassagem() {
 
         const pix = JSON.parse(salvo);
 
-        if (pix?.id_transacao) {
+        if (
+          pix?.vendaId &&
+          pix?.expiraEm &&
+          new Date(pix.expiraEm).getTime() <= Date.now()
+        ) {
+          await AsyncStorage.removeItem(getCheckoutStorageKey());
+          return;
+        }
+
+        if (pix?.vendaId || pix?.id_transacao) {
           setDadosPix(pix);
           setResumoOficial(pix.financeiro || null);
         }
@@ -405,11 +418,12 @@ export default function CheckoutPassagem() {
     }
   }, [dataViagemParam]);
 
-  // 📡 MONITOR DE PAGAMENTO COM GESTÃO DE MEMÓRIA
-  const iniciarMonitoramento = (idTransacao: string) => {
-    const transacao = String(idTransacao || "").trim();
+  // 📡 Monitora a venda oficial. O bilhete só aparece depois que o webhook
+  // confirma o pagamento e o backend conclui a emissão atômica.
+  const iniciarMonitoramento = (identificador: string) => {
+    const id = String(identificador || "").trim();
 
-    if (!transacao || !mountedRef.current) return;
+    if (!id || !mountedRef.current) return;
 
     try {
       if (unsubPagamento.current) {
@@ -417,9 +431,44 @@ export default function CheckoutPassagem() {
         unsubPagamento.current = null;
       }
 
+      if (id.startsWith("VND-")) {
+        unsubPagamento.current = onSnapshot(
+          doc(db, "vendas", id),
+          (snapshot) => {
+            if (!mountedRef.current || !snapshot.exists()) return;
+
+            const venda = snapshot.data();
+            const pagamentoId = String(venda.pagamentoId || "").trim();
+            const bilhetesEmitidos = Number(venda.bilhetesEmitidos || 0);
+            const confirmada =
+              String(venda.statusVenda || "").toLowerCase() === "confirmada" &&
+              bilhetesEmitidos > 0 &&
+              !!pagamentoId;
+
+            if (!confirmada) return;
+
+            if (unsubPagamento.current) {
+              unsubPagamento.current();
+              unsubPagamento.current = null;
+            }
+
+            AsyncStorage.removeItem(getCheckoutStorageKey()).catch(() => {});
+            router.replace({
+              pathname: "/bilhete",
+              params: { pagamentoId },
+            });
+          },
+          (error) => {
+            console.log("Erro no monitoramento da venda:", error);
+          },
+        );
+        return;
+      }
+
+      // Compatibilidade temporária com um Pix pendente criado na versão antiga.
       const q = query(
         collection(db, "passagens"),
-        where("pagamentoId", "==", transacao),
+        where("pagamentoId", "==", id),
       );
 
       unsubPagamento.current = onSnapshot(
@@ -452,7 +501,7 @@ export default function CheckoutPassagem() {
 
           router.replace({
             pathname: "/bilhete",
-            params: { pagamentoId: transacao },
+            params: { pagamentoId: id },
           });
         },
         (error) => {
@@ -465,7 +514,8 @@ export default function CheckoutPassagem() {
   };
 
   useEffect(() => {
-    if (dadosPix?.id_transacao) iniciarMonitoramento(dadosPix.id_transacao);
+    const identificador = dadosPix?.vendaId || dadosPix?.id_transacao;
+    if (identificador) iniciarMonitoramento(identificador);
 
     return () => {
       if (unsubPagamento.current) {
@@ -473,12 +523,12 @@ export default function CheckoutPassagem() {
         unsubPagamento.current = null;
       }
     };
-  }, [dadosPix?.id_transacao]);
+  }, [dadosPix?.vendaId, dadosPix?.id_transacao]);
 
   useEffect(() => {
     async function salvarPixPendente() {
       try {
-        if (dadosPix?.id_transacao) {
+        if (dadosPix?.vendaId || dadosPix?.id_transacao) {
           await AsyncStorage.setItem(
             getCheckoutStorageKey(),
             JSON.stringify(dadosPix),
@@ -491,6 +541,7 @@ export default function CheckoutPassagem() {
 
     salvarPixPendente();
   }, [
+    dadosPix?.vendaId,
     dadosPix?.id_transacao,
     user?.uid,
     idViagemParam,
@@ -503,10 +554,12 @@ export default function CheckoutPassagem() {
     const sub = AppState.addEventListener("change", (nextState) => {
       appAtivoRef.current = nextState === "active";
 
-      if (nextState === "active" && dadosPix?.id_transacao) {
+      const identificador = dadosPix?.vendaId || dadosPix?.id_transacao;
+
+      if (nextState === "active" && identificador) {
         setTimeout(() => {
           if (mountedRef.current) {
-            iniciarMonitoramento(dadosPix.id_transacao);
+            iniciarMonitoramento(identificador);
           }
         }, 800);
       }
@@ -520,7 +573,7 @@ export default function CheckoutPassagem() {
     });
 
     return () => sub.remove();
-  }, [dadosPix?.id_transacao]);
+  }, [dadosPix?.vendaId, dadosPix?.id_transacao]);
 
   const compradorCidadeResidencia = String(
     perfilComprador?.cidadeResidencia || "",
@@ -604,12 +657,50 @@ export default function CheckoutPassagem() {
   };
 
   const verificarManual = async () => {
-    if (!dadosPix?.id_transacao) return;
+    const vendaId = String(dadosPix?.vendaId || "").trim();
+    const pagamentoIdAntigo = String(dadosPix?.id_transacao || "").trim();
+    if (!vendaId && !pagamentoIdAntigo) return;
     setVerificando(true);
     try {
+      if (vendaId) {
+        const vendaSnap = await getDoc(doc(db, "vendas", vendaId));
+        const venda = vendaSnap.data() || {};
+        const pagamentoId = String(venda.pagamentoId || "").trim();
+        const confirmada =
+          vendaSnap.exists() &&
+          String(venda.statusVenda || "").toLowerCase() === "confirmada" &&
+          Number(venda.bilhetesEmitidos || 0) > 0 &&
+          !!pagamentoId;
+
+        if (confirmada) {
+          await AsyncStorage.removeItem(getCheckoutStorageKey());
+          router.replace({
+            pathname: "/bilhete",
+            params: { pagamentoId },
+          });
+          return;
+        }
+
+        const status = String(venda.statusVenda || "").toLowerCase();
+        if (status === "auditoria_necessaria") {
+          exibirAviso(
+            "Pagamento em conferência",
+            "A equipe Cadê Meu Barco foi avisada. A venda continuará bloqueada até a conferência.",
+            "aviso",
+          );
+          return;
+        }
+
+        exibirAviso(
+          "Aguardando confirmação",
+          "O pagamento ainda não foi confirmado. Se você acabou de pagar, aguarde alguns instantes.",
+        );
+        return;
+      }
+
       const q = query(
         collection(db, "passagens"),
-        where("pagamentoId", "==", String(dadosPix.id_transacao)),
+        where("pagamentoId", "==", pagamentoIdAntigo),
       );
       const snap = await getDocs(q);
       if (
@@ -625,7 +716,7 @@ export default function CheckoutPassagem() {
       ) {
         router.replace({
           pathname: "/bilhete",
-          params: { pagamentoId: String(dadosPix.id_transacao) },
+          params: { pagamentoId: pagamentoIdAntigo },
         });
       } else {
         exibirAviso("Aguardando", "Pagamento não confirmado ainda.");
@@ -634,6 +725,42 @@ export default function CheckoutPassagem() {
       console.log(e);
     } finally {
       setVerificando(false);
+    }
+  };
+
+  const abrirCheckoutPendente = async () => {
+    const checkoutUrl = String(dadosPix?.checkoutUrl || "").trim();
+    if (!checkoutUrl) {
+      exibirAviso(
+        "Pagamento indisponível",
+        "O endereço do Mercado Pago não foi localizado. Gere um novo pagamento.",
+        "erro",
+      );
+      return;
+    }
+
+    try {
+      const url = new URL(checkoutUrl);
+      const permitido =
+        url.protocol === "https:" &&
+        (url.hostname === "mercadopago.com" ||
+          url.hostname.endsWith(".mercadopago.com") ||
+          url.hostname === "mercadopago.com.br" ||
+          url.hostname.endsWith(".mercadopago.com.br") ||
+          url.hostname.endsWith(".mercadolibre.com"));
+      if (!permitido) throw new Error("DOMINIO_NAO_PERMITIDO");
+
+      await WebBrowser.openBrowserAsync(checkoutUrl, {
+        enableBarCollapsing: true,
+        presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+      });
+    } catch (error) {
+      console.log("Erro ao abrir checkout pendente:", error);
+      exibirAviso(
+        "Não foi possível abrir o Mercado Pago",
+        "Confira sua conexão e tente novamente.",
+        "erro",
+      );
     }
   };
 
@@ -760,7 +887,7 @@ export default function CheckoutPassagem() {
     try {
       const token = await user.getIdToken(true);
       const resposta = await fetch(
-        "https://us-central1-sistema-navegacao.cloudfunctions.net/gerarPixSeguro",
+        URL_CHECKOUT_MARKETPLACE,
         {
           method: "POST",
           headers: {
@@ -812,30 +939,64 @@ export default function CheckoutPassagem() {
         );
       }
 
-      if (
-        !dados?.id_transacao ||
-        !dados?.qr_code_copia_cola
-      ) {
-        throw new Error(
-          "A resposta do Pix veio incompleta.",
-        );
+      if (!dados?.vendaId || !dados?.checkoutUrl) {
+        throw new Error("A resposta do checkout veio incompleta.");
       }
 
-      setResumoOficial(dados.financeiro || null);
-      setDadosPix(dados);
+      const checkoutUrl = String(dados.checkoutUrl);
+      let dominioPermitido = false;
+      try {
+        const url = new URL(checkoutUrl);
+        dominioPermitido =
+          url.protocol === "https:" &&
+          (url.hostname === "mercadopago.com" ||
+            url.hostname.endsWith(".mercadopago.com") ||
+            url.hostname === "mercadopago.com.br" ||
+            url.hostname.endsWith(".mercadopago.com.br") ||
+            url.hostname.endsWith(".mercadolibre.com"));
+      } catch {
+        dominioPermitido = false;
+      }
+
+      if (!dominioPermitido) {
+        throw new Error("O endereço de pagamento retornado não é válido.");
+      }
+
+      const checkoutPendente = {
+        vendaId: String(dados.vendaId),
+        preferenciaId: String(dados.preferenciaId || ""),
+        checkoutUrl,
+        status: String(dados.status || "aguardando_pagamento"),
+        expiraEm: String(dados.expiraEm || ""),
+        criadoEm: new Date().toISOString(),
+      };
+
+      setDadosPix(checkoutPendente);
 
       await AsyncStorage.setItem(
         getCheckoutStorageKey(),
-        JSON.stringify(dados),
+        JSON.stringify(checkoutPendente),
       );
 
-      iniciarMonitoramento(
-        String(dados.id_transacao),
-      );
+      iniciarMonitoramento(checkoutPendente.vendaId);
+
+      try {
+        await WebBrowser.openBrowserAsync(checkoutUrl, {
+          enableBarCollapsing: true,
+          presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+        });
+      } catch (erroNavegador) {
+        console.log("Checkout criado, mas navegador não abriu:", erroNavegador);
+        exibirAviso(
+          "Checkout preparado",
+          "O pagamento foi preparado. Toque em ABRIR MERCADO PAGO para continuar.",
+          "aviso",
+        );
+      }
     } catch (error: any) {
-      console.log("Erro ao gerar Pix seguro:", error);
+      console.log("Erro ao preparar checkout seguro:", error);
       exibirAviso(
-        "Não foi possível gerar o Pix",
+        "Não foi possível preparar o pagamento",
         error?.message ||
           "Tente novamente em alguns instantes.",
         "erro",
@@ -921,14 +1082,26 @@ export default function CheckoutPassagem() {
 
         {dadosPix ? (
           <Animated.View entering={FadeInUp} style={styles.cardPix}>
-            <Ionicons name="qr-code" size={50} color="#10b981" />
-            <Text style={styles.pixTitle}>PIX GERADO</Text>
+            <Ionicons
+              name={dadosPix?.checkoutUrl ? "shield-checkmark" : "qr-code"}
+              size={50}
+              color="#10b981"
+            />
+            <Text style={styles.pixTitle}>
+              {dadosPix?.checkoutUrl ? "PAGAMENTO PREPARADO" : "PIX GERADO"}
+            </Text>
             <Text style={styles.pixValor}>
               R$ {Number(
                 dadosPix?.financeiro?.totalPagoPassageiro ||
                   totalGeral,
               ).toFixed(2)}
             </Text>
+            {dadosPix?.checkoutUrl && (
+              <Text style={styles.checkoutOrientacao}>
+                Conclua o pagamento no ambiente seguro do Mercado Pago. A
+                passagem aparecerá somente depois da confirmação.
+              </Text>
+            )}
             {dadosPix.qr_code_base64 && (
               <Image
                 source={{
@@ -937,40 +1110,55 @@ export default function CheckoutPassagem() {
                 style={styles.qrCode}
               />
             )}
-            <TouchableOpacity
-              style={[
-                styles.btnCopy,
-                foiCopiado && { backgroundColor: "#10b981" },
-              ]}
-              onPress={() => {
-                if (!dadosPix?.qr_code_copia_cola) {
-                  exibirAviso(
-                    "Pix indisponível",
-                    "O código Pix ainda não foi carregado.",
-                    "aviso",
-                  );
-                  return;
-                }
-
-                Clipboard.setStringAsync(dadosPix.qr_code_copia_cola);
-                setFoiCopiado(true);
-                setTimeout(() => {
-                  if (mountedRef.current) setFoiCopiado(false);
-                }, 3000);
-              }}
-            >
-              <Ionicons
-                name={foiCopiado ? "checkmark-circle" : "copy-outline"}
-                size={20}
-                color={foiCopiado ? "#fff" : "#0f172a"}
-                style={{ marginRight: 8 }}
-              />
-              <Text
-                style={[styles.btnCopyText, foiCopiado && { color: "#fff" }]}
+            {dadosPix?.checkoutUrl ? (
+              <TouchableOpacity
+                style={styles.btnCopy}
+                onPress={abrirCheckoutPendente}
               >
-                {foiCopiado ? "CÓDIGO COPIADO!" : "COPIAR CÓDIGO PIX"}
-              </Text>
-            </TouchableOpacity>
+                <Ionicons
+                  name="open-outline"
+                  size={20}
+                  color="#0f172a"
+                  style={{ marginRight: 8 }}
+                />
+                <Text style={styles.btnCopyText}>ABRIR MERCADO PAGO</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={[
+                  styles.btnCopy,
+                  foiCopiado && { backgroundColor: "#10b981" },
+                ]}
+                onPress={() => {
+                  if (!dadosPix?.qr_code_copia_cola) {
+                    exibirAviso(
+                      "Pix indisponível",
+                      "O código Pix ainda não foi carregado.",
+                      "aviso",
+                    );
+                    return;
+                  }
+
+                  Clipboard.setStringAsync(dadosPix.qr_code_copia_cola);
+                  setFoiCopiado(true);
+                  setTimeout(() => {
+                    if (mountedRef.current) setFoiCopiado(false);
+                  }, 3000);
+                }}
+              >
+                <Ionicons
+                  name={foiCopiado ? "checkmark-circle" : "copy-outline"}
+                  size={20}
+                  color={foiCopiado ? "#fff" : "#0f172a"}
+                  style={{ marginRight: 8 }}
+                />
+                <Text
+                  style={[styles.btnCopyText, foiCopiado && { color: "#fff" }]}
+                >
+                  {foiCopiado ? "CÓDIGO COPIADO!" : "COPIAR CÓDIGO PIX"}
+                </Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               style={styles.btnVerificar}
               onPress={verificarManual}
@@ -980,7 +1168,7 @@ export default function CheckoutPassagem() {
                 <ActivityIndicator color="#38bdf8" />
               ) : (
                 <Text style={styles.btnVerificarText}>
-                  JÁ PAGUEI, VERIFICAR STATUS
+                  CONSULTAR CONFIRMAÇÃO
                 </Text>
               )}
             </TouchableOpacity>
@@ -1210,7 +1398,7 @@ export default function CheckoutPassagem() {
               </Text>
               <Text style={styles.totalAviso}>
                 O valor oficial será validado no servidor antes
-                da geração do Pix.
+                da abertura do Mercado Pago.
               </Text>
             </View>
             <TouchableOpacity
@@ -1228,7 +1416,7 @@ export default function CheckoutPassagem() {
                 <Text style={styles.btnFinalizarText}>
                   {vendaForaDoPrazo()
                     ? "VENDAS ENCERRADAS"
-                    : "GERAR PAGAMENTO PIX"}
+                    : "CONTINUAR PARA PAGAMENTO"}
                 </Text>
               )}
             </TouchableOpacity>
@@ -1485,6 +1673,13 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     marginTop: 6,
     marginBottom: 15,
+  },
+  checkoutOrientacao: {
+    color: "#cbd5e1",
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: "center",
+    marginBottom: 20,
   },
   qrCode: { width: 220, height: 220, borderRadius: 15, marginBottom: 20 },
   btnCopy: {
