@@ -161,10 +161,12 @@ export function obterConfiguracaoVendasBarco(
 
 export function deveExibirBotaoComprar(barco: any) {
   const configuracao = obterConfiguracaoVendasBarco(barco);
+  const modoPilotoMarketplace =
+    barco?.vendasPassagens?.modoPilotoMarketplace === true;
 
   return (
     configuracao.ativa === true &&
-    configuracao.pagamento.pixAtivo === true
+    (modoPilotoMarketplace || configuracao.pagamento.pixAtivo === true)
   );
 }
 
