@@ -113,10 +113,13 @@ export function obterConfiguracaoVendasBarco(
 
   return {
     ativa:
-      nova.ativa ??
-      barco?.vendaPassagemHabilitada ??
-      legado.vendaPassagemHabilitada ??
-      false,
+      nova.modoPilotoMarketplace === true ||
+      (
+        nova.ativa ??
+        barco?.vendaPassagemHabilitada ??
+        legado.vendaPassagemHabilitada ??
+        false
+      ),
     regraTaxa: {
       ativa: nova.regraTaxa?.ativa !== false,
       tipo: nova.regraTaxa?.tipo || "percentual",
