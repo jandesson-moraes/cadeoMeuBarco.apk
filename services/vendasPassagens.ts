@@ -62,6 +62,45 @@ export function normalizarChaveBusca(valor: unknown) {
     .replace(/\s+/g, " ");
 }
 
+function semTipoDeTerminal(valor: string) {
+  return valor
+    .replace(/^(porto|terminal|trapiche|marina|ponto de embarque)\s+(de|do|da|dos|das)?\s*/i, "")
+    .trim();
+}
+
+function variantesLocal(valor: unknown) {
+  const normalizado = normalizarChaveBusca(valor);
+  if (!normalizado) return [];
+  const semUf = normalizado.replace(/\s+-\s+[a-z]{2}$/i, "").trim();
+  return Array.from(
+    new Set([normalizado, semUf, semTipoDeTerminal(normalizado), semTipoDeTerminal(semUf)]),
+  ).filter(Boolean);
+}
+
+export function localCorrespondeBusca(local: any, busca: unknown) {
+  const buscas = variantesLocal(busca);
+  if (!buscas.length) return false;
+  const campos = typeof local === "string"
+    ? [local]
+    : [
+        local?.porto,
+        local?.nome,
+        local?.cidade,
+        local?.cidadeNome,
+        local?.nomeCidade,
+        local?.portoNome,
+      ];
+  const locais = campos.flatMap(variantesLocal);
+  return buscas.some((procurado) =>
+    locais.some(
+      (candidato) =>
+        candidato === procurado ||
+        candidato.includes(procurado) ||
+        procurado.includes(candidato),
+    ),
+  );
+}
+
 export function obterIdBarcoDaGrade(grade: any) {
   const candidatos = [
     grade?.barcoId,
@@ -198,22 +237,13 @@ export function obterTarifaTrecho(
     : Array.isArray(grade?.escalas)
       ? grade.escalas
       : [];
-  const encontrarPonto = (valor: string) => {
-    const procurado = normalizarChaveBusca(valor).split(" - ")[0];
-    return itinerario.find((ponto: any) =>
-      [ponto?.porto, ponto?.nome, ponto?.cidade].some(
-        (campo) =>
-          normalizarChaveBusca(campo).split(" - ")[0] === procurado,
-      ),
-    );
-  };
+  const encontrarPonto = (valor: string) =>
+    itinerario.find((ponto: any) => localCorrespondeBusca(ponto, valor));
 
   const pontoOrigem = encontrarPonto(origem);
   const pontoDestino = encontrarPonto(destino);
   const origemId = String(pontoOrigem?.portoId || pontoOrigem?.id || "");
   const destinoId = String(pontoDestino?.portoId || pontoDestino?.id || "");
-  const origemNormalizada = normalizarChaveBusca(origem).split(" - ")[0];
-  const destinoNormalizado = normalizarChaveBusca(destino).split(" - ")[0];
 
   return (
     tarifas.find((tarifa: any) => {
@@ -224,12 +254,16 @@ export function obterTarifaTrecho(
         String(tarifa?.origemPortoId || "") === origemId &&
         String(tarifa?.destinoPortoId || "") === destinoId;
       const correspondeNomes =
-        normalizarChaveBusca(tarifa?.origemNome || tarifa?.origem).split(
-          " - ",
-        )[0] === origemNormalizada &&
-        normalizarChaveBusca(tarifa?.destinoNome || tarifa?.destino).split(
-          " - ",
-        )[0] === destinoNormalizado;
+        [pontoOrigem?.porto, pontoOrigem?.nome, pontoOrigem?.cidade, origem]
+          .filter(Boolean)
+          .some((valor) =>
+            localCorrespondeBusca(tarifa?.origemNome || tarifa?.origem, valor),
+          ) &&
+        [pontoDestino?.porto, pontoDestino?.nome, pontoDestino?.cidade, destino]
+          .filter(Boolean)
+          .some((valor) =>
+            localCorrespondeBusca(tarifa?.destinoNome || tarifa?.destino, valor),
+          );
       return correspondeIds || correspondeNomes;
     }) || null
   );

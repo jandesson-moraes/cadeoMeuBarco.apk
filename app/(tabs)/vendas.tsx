@@ -17,8 +17,11 @@ import { Calendar, LocaleConfig } from "react-native-calendars";
 import Animated, { FadeInDown } from "react-native-reanimated";
 import { db } from "../../services/firebase";
 import {
+  calcularPreviaTaxaNoApp,
   deveExibirBotaoComprar,
+  localCorrespondeBusca,
   localizarBarcoDaGrade,
+  obterConfiguracaoVendasBarco,
   obterTarifaTrecho,
 } from "../../services/vendasPassagens";
 
@@ -254,30 +257,41 @@ export default function VendasScreen() {
             ) {
               return false;
             }
-            const pOrigem = (grade.porto_origem || grade.portoOrigem || "")
-              .toLowerCase()
-              .trim();
-            const escalas = grade.itinerario || grade.escalas || [];
-            const bOrigem = origem.toLowerCase().trim();
-            const bDestino = destino.toLowerCase().trim();
-            let idxO = pOrigem.includes(bOrigem)
-              ? 0
-              : escalas.findIndex((i: any) =>
-                  (i.porto || "").toLowerCase().includes(bOrigem),
-                ) + 1;
-            if (idxO <= 0 && !pOrigem.includes(bOrigem)) return false;
-            let diasAt =
-              idxO > 0
-                ? parseInt(
-                    escalas[idxO - 1].dias_apos_saida ||
-                      escalas[idxO - 1].diaRelativo ||
-                      "0",
-                  )
-                : 0;
-            const idxD = escalas.findIndex((i: any) =>
-              (i.porto || "").toLowerCase().includes(bDestino),
+            const pOrigem = grade.porto_origem || grade.portoOrigem ||
+              grade.origemPortoNome || grade.origemCidade || grade.origem || "";
+            const itinerarioOriginal = Array.isArray(grade.itinerario)
+              ? grade.itinerario
+              : Array.isArray(grade.escalas)
+                ? grade.escalas
+                : [];
+            const itinerario =
+              itinerarioOriginal.length > 0 &&
+              localCorrespondeBusca(itinerarioOriginal[0], pOrigem)
+                ? itinerarioOriginal
+                : [
+                    {
+                      porto: pOrigem,
+                      nome: pOrigem,
+                      cidade: grade.origemCidade || grade.origem,
+                      horarioSaida:
+                        grade.horario_saida_origem || grade.horarioSaida,
+                      diaRelativo: 0,
+                    },
+                    ...itinerarioOriginal,
+                  ];
+            const idxO = itinerario.findIndex((ponto: any) =>
+              localCorrespondeBusca(ponto, origem),
             );
-            if (idxD === -1 || idxD + 1 <= idxO) return false;
+            const idxD = itinerario.findIndex(
+              (ponto: any, indice: number) =>
+                indice > idxO && localCorrespondeBusca(ponto, destino),
+            );
+            if (idxO < 0 || idxD <= idxO) return false;
+            const pontoOrigem = itinerario[idxO] || {};
+            const pontoDestino = itinerario[idxD] || {};
+            const diasAt = parseInt(
+              pontoOrigem.dias_apos_saida || pontoOrigem.diaRelativo || "0",
+            );
             if (
               !(grade.dias_da_semana || grade.diasSemana || []).includes(
                 (diaSemana - diasAt + 7) % 7,
@@ -290,12 +304,17 @@ export default function VendasScreen() {
             grade.horarioSaida =
               idxO === 0
                 ? grade.horario_saida_origem || grade.horarioSaida
-                : escalas[idxO - 1].horario_chegada ||
-                  escalas[idxO - 1].horario;
+                : pontoOrigem.horarioSaida ||
+                  pontoOrigem.horario_saida ||
+                  pontoOrigem.horario_chegada ||
+                  pontoOrigem.horarioChegada ||
+                  pontoOrigem.horario;
             grade.horarioChegadaExibicao =
-              escalas[idxD].horario_chegada || escalas[idxD].horario;
+              pontoDestino.horarioChegada ||
+              pontoDestino.horario_chegada ||
+              pontoDestino.horario;
             const tarifaTrecho = obterTarifaTrecho(grade, origem, destino);
-            grade.precoExibicao = parseFloat(
+            grade.precoBase = parseFloat(
               tarifaTrecho?.precoRede ||
                 tarifaTrecho?.preco_rede ||
                 tarifaTrecho?.preco_da_origem ||
@@ -303,15 +322,25 @@ export default function VendasScreen() {
                 tarifaTrecho?.preco_poltrona ||
                 tarifaTrecho?.precoSuite ||
                 tarifaTrecho?.preco_suite ||
-                escalas[idxD].preco_da_origem ||
-                escalas[idxD].precoRede ||
+                pontoDestino.preco_da_origem ||
+                pontoDestino.precoRede ||
                 0,
             );
-            const inter = escalas.slice(idxO, idxD).map((e: any) => e.porto);
-            grade.itinerarioFormatado =
-              grade.sentido === "volta"
-                ? `${destino} ← ${origem} (via: ${[...inter].reverse().join(" ← ")})`
-                : `${origem} → ${destino} (via: ${inter.join(" → ")})`;
+            const previa = calcularPreviaTaxaNoApp({
+              regra: obterConfiguracaoVendasBarco(grade.barcoData).regraTaxa,
+              quantidade: 1,
+              valorUnitario: grade.precoBase,
+            });
+            grade.precoExibicao = previa.totalPassageiro;
+            const intermediarios = itinerario
+              .slice(idxO + 1, idxD)
+              .map((ponto: any) => ponto.cidade || ponto.porto || ponto.nome)
+              .filter(Boolean);
+            const separador = " → ";
+            const rotaPrincipal = [origem, destino].join(separador);
+            grade.itinerarioFormatado = intermediarios.length
+              ? `${rotaPrincipal} (via: ${intermediarios.join(separador)})`
+              : rotaPrincipal;
             return true;
           });
         setViagens(filtrado);
@@ -516,7 +545,7 @@ export default function VendasScreen() {
                       dataViagem: diaSelecionado,
                       origemDesejada: item.buscaOrigemExibicao,
                       destinoDesejado: item.buscaDestinoExibicao,
-                      precoCalculado: item.precoExibicao,
+                      precoCalculado: item.precoBase,
                       idViagem: idViagemParam,
                       horarioSaida: item.horarioSaida,
                     },

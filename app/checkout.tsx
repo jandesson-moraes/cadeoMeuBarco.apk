@@ -55,6 +55,46 @@ interface Passageiro {
   aceiteComprovacao: boolean;
 }
 
+function idadePelaDataNascimento(valor: string) {
+  const partes = String(valor || "").split("/").map(Number);
+  if (partes.length !== 3) return null;
+  const [dia, mes, ano] = partes;
+  const nascimento = new Date(ano, mes - 1, dia);
+  if (
+    !Number.isFinite(nascimento.getTime()) ||
+    nascimento.getDate() !== dia ||
+    nascimento.getMonth() !== mes - 1 ||
+    nascimento.getFullYear() !== ano ||
+    nascimento.getTime() > Date.now()
+  ) return null;
+  const hoje = new Date();
+  let idade = hoje.getFullYear() - ano;
+  if (
+    hoje.getMonth() < mes - 1 ||
+    (hoje.getMonth() === mes - 1 && hoje.getDate() < dia)
+  ) idade -= 1;
+  return idade;
+}
+
+function textoRegraIdade(beneficio: Partial<BeneficioTarifaPublico>) {
+  const minima = beneficio.idadeMinima;
+  const maxima = beneficio.idadeMaxima;
+  if (minima != null && maxima != null) return `de ${minima} a ${maxima} anos`;
+  if (minima != null) return `a partir de ${minima} anos`;
+  if (maxima != null) return `até ${maxima} anos`;
+  return "";
+}
+
+function idadeAtendeBeneficio(
+  idade: number,
+  beneficio: Partial<BeneficioTarifaPublico>,
+) {
+  return !(
+    (beneficio.idadeMinima != null && idade < beneficio.idadeMinima) ||
+    (beneficio.idadeMaxima != null && idade > beneficio.idadeMaxima)
+  );
+}
+
 const URL_CHECKOUT_MARKETPLACE =
   "https://us-central1-sistema-navegacao.cloudfunctions.net/criarCheckoutVendaMarketplace";
 
@@ -913,9 +953,30 @@ export default function CheckoutPassagem() {
         return;
       }
 
+      const idade = idadePelaDataNascimento(passageiro.nascimento);
+      if (idade === null) {
+        exibirAviso(
+          "Data de nascimento inválida",
+          `Confira a data informada${referencia} (DD/MM/AAAA).`,
+        );
+        return;
+      }
+
       const beneficio = beneficiosDisponiveis.find(
         (item) => item.id === passageiro.beneficioId,
       );
+      if (
+        beneficio &&
+        passageiro.beneficioId !== "integral" &&
+        !idadeAtendeBeneficio(idade, beneficio)
+      ) {
+        exibirAviso(
+          "Idade não permitida",
+          `${beneficio.nome} é válido ${textoRegraIdade(beneficio)}${referencia}.`,
+          "aviso",
+        );
+        return;
+      }
       if (
         passageiro.beneficioId !== "integral" &&
         (!beneficio ||
@@ -1400,12 +1461,20 @@ export default function CheckoutPassagem() {
                         ...beneficiosDisponiveis,
                       ].map((beneficio) => {
                         const selecionado = p.beneficioId === beneficio.id;
+                        const idade = idadePelaDataNascimento(p.nascimento);
+                        const indisponivelPorIdade =
+                          beneficio.id !== "integral" &&
+                          idade !== null &&
+                          !idadeAtendeBeneficio(idade, beneficio);
+                        const regraIdade = textoRegraIdade(beneficio);
                         return (
                           <TouchableOpacity
                             key={beneficio.id}
+                            disabled={indisponivelPorIdade}
                             style={[
                               styles.beneficioOpcao,
                               selecionado && styles.beneficioOpcaoAtiva,
+                              indisponivelPorIdade && styles.beneficioOpcaoDesabilitada,
                             ]}
                             onPress={() => {
                               const n = [...passageiros];
@@ -1426,6 +1495,7 @@ export default function CheckoutPassagem() {
                               ]}
                             >
                               {beneficio.nome}
+                              {regraIdade ? ` (${regraIdade})` : ""}
                               {beneficio.modo === "gratuidade"
                                 ? " — gratuidade"
                                 : beneficio.modo === "valor_fixo"
@@ -1716,6 +1786,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   beneficioOpcaoAtiva: { borderColor: "#38bdf8", backgroundColor: "#0c4a6e" },
+  beneficioOpcaoDesabilitada: { opacity: 0.42 },
   beneficioOpcaoTexto: { color: "#94a3b8", fontSize: 12, fontWeight: "700" },
   beneficioOpcaoTextoAtivo: { color: "#e0f2fe" },
   comprovacaoLinha: {
