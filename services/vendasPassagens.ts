@@ -31,6 +31,19 @@ export type ConfiguracaoVendasBarco = {
   limiteHorasAntesSaida: number;
 };
 
+export type BeneficioTarifaPublico = {
+  id: string;
+  nome: string;
+  ativo: boolean;
+  modo: "desconto_percentual" | "valor_fixo" | "gratuidade";
+  valor: number;
+  vagasPorSaida: number | null;
+  idadeMinima: number | null;
+  idadeMaxima: number | null;
+  exigeComprovante: boolean;
+  observacao?: string;
+};
+
 function numero(valor: unknown, padrao = 0) {
   const n = Number(String(valor ?? "").replace(",", "."));
   return Number.isFinite(n) ? n : padrao;
@@ -222,6 +235,47 @@ export function obterTarifaTrecho(
   );
 }
 
+export function obterBeneficiosTarifa(tarifa: any): BeneficioTarifaPublico[] {
+  const beneficios = Array.isArray(tarifa?.beneficios) ? tarifa.beneficios : [];
+  return beneficios
+    .filter((item: any) => item?.ativo === true && String(item?.id || "").trim())
+    .map((item: any) => ({
+      id: String(item.id).trim(),
+      nome: String(item.nome || item.id).trim(),
+      ativo: true,
+      modo: ["desconto_percentual", "valor_fixo", "gratuidade"].includes(item.modo)
+        ? item.modo
+        : "desconto_percentual",
+      valor: Math.max(0, numero(item.valor)),
+      vagasPorSaida: item.vagasPorSaida === null || item.vagasPorSaida === undefined
+        ? null
+        : Math.max(0, Math.floor(numero(item.vagasPorSaida))),
+      idadeMinima: item.idadeMinima === null || item.idadeMinima === undefined
+        ? null
+        : Math.max(0, Math.floor(numero(item.idadeMinima))),
+      idadeMaxima: item.idadeMaxima === null || item.idadeMaxima === undefined
+        ? null
+        : Math.max(0, Math.floor(numero(item.idadeMaxima))),
+      exigeComprovante: item.exigeComprovante !== false,
+      observacao: String(item.observacao || "").trim(),
+    }));
+}
+
+export function calcularValorPassagemComBeneficio(
+  valorIntegral: number,
+  beneficio?: BeneficioTarifaPublico | null,
+) {
+  const base = Math.max(0, numero(valorIntegral));
+  if (!beneficio) return arredondar(base);
+  if (beneficio.modo === "gratuidade") return 0;
+  if (beneficio.modo === "valor_fixo") {
+    return arredondar(Math.min(base, Math.max(0, beneficio.valor)));
+  }
+  return arredondar(
+    base * (1 - Math.min(100, Math.max(0, beneficio.valor)) / 100),
+  );
+}
+
 /**
  * Apenas uma prévia visual no aplicativo.
  * O backend recalcula os valores oficiais antes de gerar o pagamento.
@@ -231,15 +285,24 @@ export function calcularPreviaTaxaNoApp({
   quantidade,
   valorUnitario,
   adicionais = 0,
+  valoresPassagens,
 }: {
   regra: RegraTaxaVenda;
   quantidade: number;
   valorUnitario: number;
   adicionais?: number;
+  valoresPassagens?: number[];
 }) {
-  const qtd = Math.max(1, Math.floor(numero(quantidade, 1)));
+  const valoresIndividuais = Array.isArray(valoresPassagens)
+    ? valoresPassagens.map((valor) => arredondar(Math.max(0, numero(valor))))
+    : [];
+  const qtd = valoresIndividuais.length > 0
+    ? valoresIndividuais.length
+    : Math.max(1, Math.floor(numero(quantidade, 1)));
   const passagens = arredondar(
-    qtd * Math.max(0, numero(valorUnitario)),
+    valoresIndividuais.length > 0
+      ? valoresIndividuais.reduce((total, valor) => total + valor, 0)
+      : qtd * Math.max(0, numero(valorUnitario)),
   );
   const valorAdicionais = arredondar(
     Math.max(0, numero(adicionais)),

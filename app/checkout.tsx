@@ -34,11 +34,15 @@ import Animated, {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { auth, db } from "../services/firebase";
 import {
+  calcularValorPassagemComBeneficio,
   calcularPreviaTaxaNoApp,
   deveExibirBotaoComprar,
   localizarBarcoDaGrade,
+  obterBeneficiosTarifa,
   obterConfiguracaoVendasBarco,
   obterIdBarcoDaGrade,
+  obterTarifaTrecho,
+  type BeneficioTarifaPublico,
 } from "../services/vendasPassagens";
 
 interface Passageiro {
@@ -47,6 +51,8 @@ interface Passageiro {
   documento: string;
   nacionalidade: string;
   nascimento: string;
+  beneficioId: string;
+  aceiteComprovacao: boolean;
 }
 
 const URL_CHECKOUT_MARKETPLACE =
@@ -168,6 +174,9 @@ export default function CheckoutPassagem() {
   >("rede");
   const [incluiRefeicao, setIncluiRefeicao] = useState(false);
   const [taxaRefeicao, setTaxaRefeicao] = useState(0);
+  const [beneficiosDisponiveis, setBeneficiosDisponiveis] = useState<
+    BeneficioTarifaPublico[]
+  >([]);
   const [horarioEmbarque, setHorarioEmbarque] = useState(
     horarioVindoDaBusca || "---",
   );
@@ -183,6 +192,8 @@ export default function CheckoutPassagem() {
       documento: "",
       nacionalidade: "Brasileira",
       nascimento: "",
+      beneficioId: "integral",
+      aceiteComprovacao: false,
     },
   ]);
   const [modalAviso, setModalAviso] = useState({
@@ -328,33 +339,41 @@ export default function CheckoutPassagem() {
             normalizar(item?.porto || item?.cidade) === destinoAlvo,
         );
 
-        if (parada) {
+        const tarifaTrecho = obterTarifaTrecho(
+          dados,
+          origemDesejada,
+          destinoDesejado,
+        );
+        const fonteTarifa = tarifaTrecho || parada;
+
+        if (fonteTarifa) {
           setPrecosReais({
             rede: Number(
-              parada.preco_da_origem ??
-                parada.precoRede ??
-                parada.preco_rede ??
-                parada.preco ??
+              fonteTarifa.preco_da_origem ??
+                fonteTarifa.precoRede ??
+                fonteTarifa.preco_rede ??
+                fonteTarifa.preco ??
                 0,
             ),
             poltrona: Number(
-              parada.preco_poltrona ??
-                parada.precoPoltrona ??
+              fonteTarifa.preco_poltrona ??
+                fonteTarifa.precoPoltrona ??
                 0,
             ),
             suite: Number(
-              parada.preco_suite ??
-                parada.precoSuite ??
+              fonteTarifa.preco_suite ??
+                fonteTarifa.precoSuite ??
                 0,
             ),
           });
           setTaxaRefeicao(
             Number(
-              parada.preco_refeicao ??
-                parada.precoRefeicao ??
+              fonteTarifa.preco_refeicao ??
+                fonteTarifa.precoRefeicao ??
                 0,
             ),
           );
+          setBeneficiosDisponiveis(obterBeneficiosTarifa(fonteTarifa));
         }
 
         let barcoEncontrado: any = null;
@@ -607,18 +626,31 @@ export default function CheckoutPassagem() {
   );
 
   const previaFinanceira = useMemo(
-    () =>
-      calcularPreviaTaxaNoApp({
+    () => {
+      const valoresPassagens = passageiros.map((passageiro) => {
+        const beneficio = beneficiosDisponiveis.find(
+          (item) => item.id === passageiro.beneficioId,
+        );
+        return calcularValorPassagemComBeneficio(
+          precosReais[tipoAcomodacao],
+          beneficio,
+        );
+      });
+      return calcularPreviaTaxaNoApp({
         regra: configuracaoVendas.regraTaxa,
         quantidade: passageiros.length,
         valorUnitario: precosReais[tipoAcomodacao],
+        valoresPassagens,
         adicionais: incluiRefeicao
           ? taxaRefeicao * passageiros.length
           : 0,
-      }),
+      });
+    },
     [
       configuracaoVendas.regraTaxa,
       passageiros.length,
+      passageiros,
+      beneficiosDisponiveis,
       precosReais,
       tipoAcomodacao,
       incluiRefeicao,
@@ -832,9 +864,9 @@ export default function CheckoutPassagem() {
 
     if (!Number.isFinite(totalGeral) || totalGeral <= 0) {
       exibirAviso(
-        "Valor inválido",
-        "Não foi possível calcular o valor da passagem. Volte e selecione origem, destino e acomodação novamente.",
-        "erro",
+        "Gratuidade sujeita à validação",
+        "Esta compra ficou com valor integralmente gratuito e não pode seguir para o Mercado Pago. Procure a embarcação ou a equipe Cadê Meu Barco para validar o benefício e emitir a passagem.",
+        "aviso",
       );
       return;
     }
@@ -877,6 +909,22 @@ export default function CheckoutPassagem() {
         exibirAviso(
           "Data de nascimento",
           `Informe a data completa${referencia} (DD/MM/AAAA).`,
+        );
+        return;
+      }
+
+      const beneficio = beneficiosDisponiveis.find(
+        (item) => item.id === passageiro.beneficioId,
+      );
+      if (
+        passageiro.beneficioId !== "integral" &&
+        (!beneficio ||
+          (beneficio.exigeComprovante && !passageiro.aceiteComprovacao))
+      ) {
+        exibirAviso(
+          "Comprovação do benefício",
+          `Confirme que o documento comprobatório será apresentado no embarque${referencia}.`,
+          "aviso",
         );
         return;
       }
@@ -925,6 +973,8 @@ export default function CheckoutPassagem() {
               nacionalidade:
                 passageiro.nacionalidade.trim(),
               nascimento: passageiro.nascimento,
+              beneficioId: passageiro.beneficioId,
+              aceiteComprovacao: passageiro.aceiteComprovacao,
             })),
           }),
         },
@@ -1337,6 +1387,96 @@ export default function CheckoutPassagem() {
                   }}
                   placeholderTextColor="#64748b"
                 />
+
+                {beneficiosDisponiveis.length > 0 && (
+                  <View style={styles.beneficioBox}>
+                    <Text style={styles.beneficioTitulo}>TIPO DE PASSAGEM</Text>
+                    <Text style={styles.beneficioAjuda}>
+                      Escolha tarifa integral ou um benefício disponível para este trecho.
+                    </Text>
+                    <View style={styles.beneficioOpcoes}>
+                      {[
+                        { id: "integral", nome: "Tarifa integral", modo: "integral", valor: 0 },
+                        ...beneficiosDisponiveis,
+                      ].map((beneficio) => {
+                        const selecionado = p.beneficioId === beneficio.id;
+                        return (
+                          <TouchableOpacity
+                            key={beneficio.id}
+                            style={[
+                              styles.beneficioOpcao,
+                              selecionado && styles.beneficioOpcaoAtiva,
+                            ]}
+                            onPress={() => {
+                              const n = [...passageiros];
+                              n[index].beneficioId = beneficio.id;
+                              n[index].aceiteComprovacao = beneficio.id === "integral";
+                              setPassageiros(n);
+                            }}
+                          >
+                            <Ionicons
+                              name={selecionado ? "radio-button-on" : "radio-button-off"}
+                              size={17}
+                              color={selecionado ? "#38bdf8" : "#64748b"}
+                            />
+                            <Text
+                              style={[
+                                styles.beneficioOpcaoTexto,
+                                selecionado && styles.beneficioOpcaoTextoAtivo,
+                              ]}
+                            >
+                              {beneficio.nome}
+                              {beneficio.modo === "gratuidade"
+                                ? " — gratuidade"
+                                : beneficio.modo === "valor_fixo"
+                                  ? ` — tarifa de R$ ${Number(beneficio.valor || 0).toFixed(2)}`
+                                  : beneficio.modo === "desconto_percentual"
+                                    ? ` — ${Number(beneficio.valor || 0)}% de desconto`
+                                    : ""}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+
+                    {p.beneficioId !== "integral" && (
+                      <>
+                        {beneficiosDisponiveis.find(
+                          (item) => item.id === p.beneficioId,
+                        )?.exigeComprovante && (
+                          <TouchableOpacity
+                            style={styles.comprovacaoLinha}
+                            onPress={() => {
+                              const n = [...passageiros];
+                              n[index].aceiteComprovacao = !n[index].aceiteComprovacao;
+                              setPassageiros(n);
+                            }}
+                          >
+                            <Ionicons
+                              name={p.aceiteComprovacao ? "checkbox" : "square-outline"}
+                              size={21}
+                              color={p.aceiteComprovacao ? "#10b981" : "#94a3b8"}
+                            />
+                            <Text style={styles.comprovacaoTexto}>
+                              Confirmo que o passageiro apresentará o documento comprobatório no embarque.
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                        {!!beneficiosDisponiveis.find(
+                          (item) => item.id === p.beneficioId,
+                        )?.observacao && (
+                          <Text style={styles.beneficioAjuda}>
+                            {
+                              beneficiosDisponiveis.find(
+                                (item) => item.id === p.beneficioId,
+                              )?.observacao
+                            }
+                          </Text>
+                        )}
+                      </>
+                    )}
+                  </View>
+                )}
               </Animated.View>
             ))}
             <TouchableOpacity
@@ -1350,6 +1490,8 @@ export default function CheckoutPassagem() {
                     documento: "",
                     nacionalidade: "Brasileira",
                     nascimento: "",
+                    beneficioId: "integral",
+                    aceiteComprovacao: false,
                   },
                 ])
               }
@@ -1358,40 +1500,8 @@ export default function CheckoutPassagem() {
               <Text style={styles.btnAddText}>ADICIONAR OUTRO PASSAGEIRO</Text>
             </TouchableOpacity>
             <View style={styles.cardTotal}>
-              <View style={styles.linhaResumo}>
-                <Text style={styles.resumoLabel}>
-                  Passagens
-                </Text>
-                <Text style={styles.resumoValor}>
-                  R$ {previaFinanceira.valorPassagens.toFixed(2)}
-                </Text>
-              </View>
-
-              {previaFinanceira.valorAdicionais > 0 && (
-                <View style={styles.linhaResumo}>
-                  <Text style={styles.resumoLabel}>
-                    Refeições e adicionais
-                  </Text>
-                  <Text style={styles.resumoValor}>
-                    R$ {previaFinanceira.valorAdicionais.toFixed(2)}
-                  </Text>
-                </View>
-              )}
-
-              {previaFinanceira.taxaPassageiro > 0 && (
-                <View style={styles.linhaResumo}>
-                  <Text style={styles.resumoLabel}>
-                    Taxa Cadê Meu Barco
-                  </Text>
-                  <Text style={styles.resumoValor}>
-                    R$ {previaFinanceira.taxaPassageiro.toFixed(2)}
-                  </Text>
-                </View>
-              )}
-
-              <View style={styles.resumoDivisor} />
               <Text style={styles.totalLabel}>
-                TOTAL A PAGAR
+                VALOR FINAL DA COMPRA
               </Text>
               <Text style={styles.totalValue}>
                 R$ {totalGeral.toFixed(2)}
@@ -1584,6 +1694,40 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#334155",
   },
+  beneficioBox: {
+    marginTop: 4,
+    padding: 13,
+    borderRadius: 14,
+    backgroundColor: "#0f172a",
+    borderWidth: 1,
+    borderColor: "#334155",
+  },
+  beneficioTitulo: { color: "#38bdf8", fontSize: 10, fontWeight: "900" },
+  beneficioAjuda: { color: "#94a3b8", fontSize: 11, lineHeight: 16, marginTop: 4 },
+  beneficioOpcoes: { gap: 7, marginTop: 10 },
+  beneficioOpcao: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#334155",
+    paddingHorizontal: 11,
+    paddingVertical: 10,
+  },
+  beneficioOpcaoAtiva: { borderColor: "#38bdf8", backgroundColor: "#0c4a6e" },
+  beneficioOpcaoTexto: { color: "#94a3b8", fontSize: 12, fontWeight: "700" },
+  beneficioOpcaoTextoAtivo: { color: "#e0f2fe" },
+  comprovacaoLinha: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 9,
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#334155",
+  },
+  comprovacaoTexto: { flex: 1, color: "#cbd5e1", fontSize: 11, lineHeight: 16 },
   btnAdd: {
     flexDirection: "row",
     alignItems: "center",
