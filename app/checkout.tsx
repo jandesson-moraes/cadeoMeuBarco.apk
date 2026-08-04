@@ -703,6 +703,33 @@ export default function CheckoutPassagem() {
       previaFinanceira.totalPassageiro,
   );
 
+  const calcularTotalFinalPorAcomodacao = (
+    tipo: keyof typeof precosReais,
+  ) => {
+    if (precosReais[tipo] <= 0) return 0;
+
+    const valoresPassagens = passageiros.map((passageiro) => {
+      const beneficio = beneficiosDisponiveis.find(
+        (item) => item.id === passageiro.beneficioId,
+      );
+
+      return calcularValorPassagemComBeneficio(
+        precosReais[tipo],
+        beneficio,
+      );
+    });
+
+    return calcularPreviaTaxaNoApp({
+      regra: configuracaoVendas.regraTaxa,
+      quantidade: passageiros.length,
+      valorUnitario: precosReais[tipo],
+      valoresPassagens,
+      adicionais: incluiRefeicao
+        ? taxaRefeicao * passageiros.length
+        : 0,
+    }).totalPassageiro;
+  };
+
   const vendaForaDoPrazo = () => {
     const dataHora = montarDataHoraViagem(
       dataViagemParam,
@@ -1295,6 +1322,9 @@ export default function CheckoutPassagem() {
                     styles.optionBtn,
                     tipoAcomodacao === tipo && styles.optionBtnActive,
                   ]}
+                  disabled={
+                    precosReais[tipo as keyof typeof precosReais] <= 0
+                  }
                   onPress={() => setTipoAcomodacao(tipo as any)}
                 >
                   <Text
@@ -1306,8 +1336,12 @@ export default function CheckoutPassagem() {
                     {tipo.toUpperCase()}
                   </Text>
                   <Text style={styles.optionPrice}>
-                    R${" "}
-                    {precosReais[tipo as keyof typeof precosReais].toFixed(2)}
+                    {precosReais[tipo as keyof typeof precosReais] > 0
+                      ? "R$ " +
+                        calcularTotalFinalPorAcomodacao(
+                          tipo as keyof typeof precosReais,
+                        ).toFixed(2)
+                      : "INDISPONÍVEL"}
                   </Text>
                 </TouchableOpacity>
               ))}
